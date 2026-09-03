@@ -10,7 +10,7 @@ from PIL import Image
 import cv2
 import math
 
-# 引入必要的库用于手动加载数据
+# Imports needed for manual data loading
 import decord 
 from transformers import AutoProcessor, AutoTokenizer, Qwen2TokenizerFast
 from vllm import LLM, SamplingParams
@@ -35,10 +35,10 @@ BSZ = args.batch_size
 NUM_FRAMES = args.nframes
 
 # ==============================================================================
-# 0. 【关键修改】Tokenizer 补丁 & 数据加载函数
+# 0. Tokenizer patch & data loading helpers
 # ==============================================================================
 def patch_tokenizer_classes():
-    """手动修复 Tokenizer 缺失属性的问题"""
+    """Patch in the tokenizer attributes InternVL's remote code expects."""
     print("Applying Patch to Qwen2TokenizerFast...")
     image_pad = "<|image_pad|>"
     vision_start = "<|vision_start|>"
@@ -64,11 +64,11 @@ def patch_tokenizer_classes():
                 return property(lambda self: self.convert_tokens_to_ids(t_str))
             setattr(Qwen2TokenizerFast, id_attr_name, make_getter(token_str))
 
-# 应用补丁
+# Apply the patch
 patch_tokenizer_classes()
 
-def load_video_frames(video_path, num_frames=32): # 【注意】这里可以安全地改回32帧了
-    """使用 decord 读取视频并返回 Uint8 numpy 数组"""
+def load_video_frames(video_path, num_frames=32):
+    """Read a video with decord and return a uint8 numpy array."""
     if not os.path.exists(video_path):
         if os.path.exists(os.path.join("./", video_path)):
              video_path = os.path.join("./", video_path)
@@ -83,15 +83,14 @@ def load_video_frames(video_path, num_frames=32): # 【注意】这里可以安�
         frames = vr.get_batch(indices).asnumpy()
         
         # ==============================================================
-        # 【新增位置】：在这里进行像素上限的拦截与缩放
-        # 对齐论文标准：最大像素为 256 * 28 * 28 = 200,704
+        # Enforce the pixel budget here, matching the paper: 256 * 28 * 28 = 200,704
         # ==============================================================
         max_pixels = 256 * 28 * 28 
         resized_frames = []
         
         for frame in frames:
             h, w = frame.shape[:2]
-            # 如果当前帧像素超过了上限，就进行等比例缩小
+            # Downscale proportionally when the frame exceeds the budget
             if h * w > max_pixels:
                 beta = math.sqrt((h * w) / max_pixels)
                 new_h = int(h / beta)
@@ -100,7 +99,7 @@ def load_video_frames(video_path, num_frames=32): # 【注意】这里可以安�
             
             resized_frames.append(frame)
             
-        # 重新打包为 numpy 数组
+        # Repack into a numpy array
         frames = np.array(resized_frames, dtype=np.uint8)
         # ==============================================================
 
@@ -110,7 +109,7 @@ def load_video_frames(video_path, num_frames=32): # 【注意】这里可以安�
         return np.zeros((num_frames, 224, 224, 3), dtype=np.uint8)
 
 def load_image(image_path):
-    """使用 PIL 读取图片"""
+    """Read an image with PIL."""
     try:
         return Image.open(image_path).convert("RGB")
     except Exception as e:
@@ -118,11 +117,11 @@ def load_image(image_path):
         return Image.new('RGB', (224, 224), (0, 0, 0))
 
 # ==============================================================================
-# 1. 模型初始化
+# 1. Model initialisation
 # ==============================================================================
 print(f"Initializing model from {MODEL_PATH}...")
 
-# 必须添加 trust_remote_code=True
+# trust_remote_code=True is required for InternVL
 llm = LLM(
     model=MODEL_PATH,
     tensor_parallel_size=args.tensor_parallel_size or torch.cuda.device_count(),
@@ -145,7 +144,7 @@ tokenizer.padding_side = "left"
 processor.tokenizer = tokenizer
 
 # ==============================================================================
-# 2. 数据处理与路径解析
+# 2. Data handling and path resolution
 # ==============================================================================
 DATA_BASE_PATH_ENV = os.environ.get("VIDEO_DATA_ROOT")
 _DATA_BASE_PATH = DATA_BASE_PATH_ENV
@@ -159,11 +158,11 @@ def resolve_media_path(resource_path: str) -> str:
         return resource_path
     
     base_path = get_data_base_path()
-    # 简单的路径拼接逻辑
+    # Simple path joining
     clean_path = resource_path.lstrip("./").lstrip("/")
     return os.path.join(base_path, clean_path)
 
-# 加载数据
+# Load the data
 data = []
 dataset_name_or_path = file_name
 from pathlib import Path
@@ -193,7 +192,7 @@ elif (not is_file) and dataset_loader is not None:
         data.append(entry)
     base_tag = dataset_name_or_path
 else:
-    raise ValueError(f"无法读取数据: {dataset_name_or_path}")
+    raise ValueError(f"Unable to read dataset: {dataset_name_or_path}")
 
 if args.output_path:
     OUTPUT_PATH = args.output_path
@@ -206,7 +205,7 @@ if output_dir:
     os.makedirs(output_dir, exist_ok=True)
 print(f"Results will be saved to: {OUTPUT_PATH}")
 
-# 模板定义
+# Prompt templates
 QUESTION_TEMPLATE = "{Question}\n"
 TYPE_TEMPLATE = {
     "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
@@ -217,7 +216,7 @@ TYPE_TEMPLATE = {
     "boolean": " Please provide only 'Yes' or 'No' as your answer within the <answer> </answer> tags."
 }
 
-# 预处理数据对
+# Pre-build the data pairs
 pairs = []
 skipped = 0
 for x in data:
@@ -233,10 +232,10 @@ for x in data:
         skipped += 1
         continue
 
-    # 路径解析逻辑
+    # Path resolution
     media_path = raw_path
     if not (str(raw_path).startswith(('http', 'https')) or os.path.isabs(str(raw_path))):
-        # 尝试在 JSON 同级目录查找
+        # Also look next to the JSON manifest
         if is_file:
             json_dir = os.path.dirname(os.path.abspath(dataset_name_or_path))
             potential_path = os.path.join(json_dir, str(raw_path).lstrip('/'))
@@ -247,21 +246,21 @@ for x in data:
         else:
             media_path = resolve_media_path(raw_path)
 
-    # 确定数据类型 (video / image)
+    # Determine the data type (video / image)
     dtype = x.get('data_type', 'video')
     if str(media_path).lower().endswith(('.jpg', '.png', '.jpeg', '.bmp', '.webp')):
         dtype = 'image'
     
-    # 简单构造 message，不带 kwargs，因为我们手动处理
+    # Build a bare message without kwargs since media is loaded manually
     user_msg = {
         "role": "user",
         "content": [
-            {"type": dtype}, # 占位符
+            {"type": dtype},  # placeholder
             {"type": "text", "text": QUESTION_TEMPLATE.format(Question=question) + TYPE_TEMPLATE.get(x.get('problem_type', 'free-form'), "")}
         ]
     }
     
-    # 将真实路径保存在 sample dict 中，方便后续手动加载
+    # Keep the resolved path on the sample dict for the manual loader below
     x['resolved_media_path'] = media_path
     x['resolved_dtype'] = dtype
     
@@ -270,7 +269,7 @@ for x in data:
 print(f"[eval_bench] Loaded {len(pairs)} samples, skipped {skipped} empty paths.")
 
 # ==============================================================================
-# 3. 评测辅助函数 (保持原样)
+# 3. Scoring helpers
 # ==============================================================================
 def extract_think(output_str):
     pattern = r'<think>\s*(.*?)\s*</think>'
@@ -298,7 +297,19 @@ def normalized_relative_score(pred, target, max_range=100.0):
     except:
         return 0.0
 
-def mean_relative_accuracy(pred, target, start=0.5, end=0.95, interval=0.05):
+# Name of the formula this harness uses to score `regression`, recorded in the
+# output file so a reader can tell which of the two formulas produced a number.
+# See the metrics section of the top-level README.
+REGRESSION_METRIC = "threshold_relative_accuracy"
+
+
+def threshold_relative_accuracy(pred, target, start=0.5, end=0.95, interval=0.05):
+    """Fraction of thresholds in [start, end] where the relative error clears 1-t.
+
+    This is the stricter, staircase-valued metric used by the baseline harnesses.
+    eval_interleave.py instead uses `linear_relative_accuracy`; the two are not
+    comparable, so never put their numbers in the same column.
+    """
     if not torch.is_tensor(pred): pred = torch.tensor(pred, dtype=torch.float32)
     if not torch.is_tensor(target): target = torch.tensor(target, dtype=torch.float32)
     epsilon = 1e-8
@@ -318,23 +329,27 @@ def reward_fn(sample, model_output, question_type):
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
             scores = scorer.score(gt_ans, output_ans)
             return (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
-        elif question_type == "numerical":
-            return normalized_relative_score(normalize_number(output_ans), normalize_number(gt_ans))
-        elif question_type == "regression":
-            return mean_relative_accuracy(normalize_number(output_ans), normalize_number(gt_ans))
+        elif question_type in ("numerical", "regression"):
+            out_number = normalize_number(output_ans)
+            gt_number = normalize_number(gt_ans)
+            if out_number is None or gt_number is None:
+                return 0.0
+            if question_type == "numerical":
+                return normalized_relative_score(out_number, gt_number)
+            return threshold_relative_accuracy(out_number, gt_number)
         return 0.0
     except:
         return 0.0
 
 # ==============================================================================
-# 4. 批量推理 Loop
+# 4. Batched inference loop
 # ==============================================================================
 final_output = []
 start_idx = 0
 mean_acc = []
 mean_mra = []
 
-# 检查是否断点续传
+# Resume from a previous run if possible
 if os.path.exists(OUTPUT_PATH):
     try:
         with open(OUTPUT_PATH, "r", encoding="utf-8") as f:
@@ -350,12 +365,12 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
     batch_messages = [msgs for (_, msgs) in batch_pairs]
     batch_samples = [sample for (sample, _) in batch_pairs]
 
-    # 构建 Prompt
+    # Build the prompt
     prompts = [processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True) for msg in batch_messages]
 
     llm_inputs = []
     
-    # 【关键修改】手动加载 batch 中的每一个视频/图片
+    # Load every video/image in the batch manually
     for idx, (sample, prompt) in enumerate(zip(batch_samples, prompts)):
         media_path = sample['resolved_media_path']
         dtype = sample['resolved_dtype']
@@ -363,21 +378,21 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         multi_modal_data = {}
         
         if dtype == 'video':
-            # 使用 decord 加载视频帧 (Uint8)
+            # Load video frames with decord (uint8)
             frames = load_video_frames(media_path, num_frames=NUM_FRAMES)
             multi_modal_data['video'] = frames
         elif dtype == 'image':
-            # 使用 PIL 加载图片
+            # Load the image with PIL
             image = load_image(media_path)
             multi_modal_data['image'] = image
             
         llm_inputs.append({
             "prompt": prompt,
             "multi_modal_data": multi_modal_data,
-            # InternVL vLLM 接口不需要额外的 fps 等参数
+            # InternVL's vLLM interface needs no extra fps arguments
         })
 
-    # 执行推理
+    # Run inference
     try:
         outputs = llm.generate(llm_inputs, sampling_params=sampling_params)
         batch_output_text = [out.outputs[0].text for out in outputs]
@@ -385,16 +400,16 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         print(f"Error in batch: {e}")
         batch_output_text = ["<answer>error</answer>"] * len(batch_pairs)
 
-    # 收集结果
+    # Collect the results
     for offset, sample in enumerate(batch_samples):
         model_output = batch_output_text[offset]
         sample["output"] = model_output
         sample["prediction"] = extract_answer(model_output)
         
-        # 移除临时字段，保持输出干净
+        # Drop scratch fields to keep the output clean
         if 'resolved_media_path' in sample: del sample['resolved_media_path']
         if 'resolved_dtype' in sample: del sample['resolved_dtype']
-        if 'prompt' in sample: del sample['prompt'] # 可选：为了减小文件体积
+        if 'prompt' in sample: del sample['prompt']  # optional: keeps the output file smaller
 
         q_type = (sample.get("problem_type", "") or "").strip().lower()
         sample["reward"] = reward_fn(sample, model_output, q_type)
@@ -407,15 +422,15 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         
         final_output.append(sample)
 
-    # 实时保存
+    # Save incrementally
     if (i // BSZ) % 5 == 0:
         with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
             json.dump({"results": final_output}, f, indent=2, ensure_ascii=False)
 
 # ==============================================================================
-# 5. 最终统计
+# 5. Final aggregation
 # ==============================================================================
-final_stats = {'mean_acc': 0.0, 'mean_mra': 0.0}
+final_stats = {'mean_acc': 0.0, 'mean_mra': 0.0, 'regression_metric': REGRESSION_METRIC}
 if mean_acc:
     final_stats['mean_acc'] = torch.tensor(mean_acc).mean().item()
 if mean_mra:

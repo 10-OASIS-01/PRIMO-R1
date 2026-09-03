@@ -1,19 +1,40 @@
-# Install the packages in r1-v .
-cd src/r1-v 
-pip install -e ".[dev]"
+#!/usr/bin/env bash
+# PRIMO-R1 environment setup.
+#
+# Assumes an activated Python 3.11 environment, e.g.
+#   conda create -n primo-r1 python=3.11 && conda activate primo-r1
+#
+# Install order matters and is not arbitrary:
+#   1. r1-v pulls in torch / vllm / trl and the eval dependencies.
+#   2. The vendored qwen-vl-utils must be installed editable AFTER r1-v, so it
+#      shadows any copy a transitive dependency dragged in from PyPI.
+#   3. The vendored transformers-main tree must be installed LAST, so nothing
+#      later replaces it. Qwen2.5-VL support shifts between upstream transformers
+#      releases; a different version is the usual cause of shape/processor errors.
+#
+# Usage: bash setup.sh
 
-# Addtional modules
-pip install wandb==0.18.3
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${REPO_ROOT}"
+
+echo "[primo] 1/4 installing src/r1-v (editable, with dev extras)"
+pip install -e "src/r1-v[dev]"
+
+echo "[primo] 2/4 installing extras not declared as package dependencies"
+# tensorboardX is optional logging; flash-attn needs an existing torch install,
+# hence --no-build-isolation.
 pip install tensorboardx
-pip install qwen_vl_utils torchvision
 pip install flash-attn --no-build-isolation
 
-# vLLM support 
-pip install vllm==0.7.2
+echo "[primo] 3/4 installing vendored qwen-vl-utils (editable, with decord)"
+# Editable and after r1-v, so this local copy wins over any PyPI qwen_vl_utils.
+pip install -e "src/qwen-vl-utils[decord]"
 
-pip install nltk
-pip install rouge_score
-pip install deepspeed
+echo "[primo] 4/4 installing vendored transformers-main"
+# Required, and deliberately last. Do not replace with a PyPI transformers.
+pip install ./transformers-main
 
-# fix transformers version
-# pip install git+https://github.com/huggingface/transformers.git@336dc69d63d56f232a183a3e7f52790429b871ef
+echo "[primo] done. Verify with:"
+echo "  python -c 'import transformers, trl, vllm, qwen_vl_utils; print(transformers.__version__, trl.__version__, vllm.__version__)'"

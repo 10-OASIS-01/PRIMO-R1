@@ -2,11 +2,13 @@
 
 Evaluation launch scripts are located in `src/eval/src/`. Run the appropriate script from the project root.
 
+The benchmark itself — split sizes, record format, and which video group each split needs — is documented on [🤗 primo-bench-json](https://huggingface.co/datasets/LeonOverload/primo-bench-json).
+
 ## 1. Environment Setup
 
 ```bash
 cd /path/to/PRIMO-R1
-conda activate daqi
+conda activate primo-r1
 
 export VIDEO_DATA_ROOT=/path/to/PRIMO-Data
 export MODEL_ROOT=/path/to/models
@@ -48,12 +50,18 @@ primo-bench-ood-agibot
 Available dataset names:
 
 ```text
+primo-bench-id-agibot
 primo-bench-ood-agibot
+primo-bench-id-behavior-1k
 primo-bench-ood-behavior-1k
-primo-bench-ood-real-humanoid
-primo-bench-ood-robotwin
 primo-bench-id-robotwin
+primo-bench-ood-robotwin
+primo-bench-ood-real-humanoid
 ```
+
+The authoritative list is the `cfg` dict in
+`src/r1-v/src/open_r1/DatasetLoader.py`; add new splits there rather than
+passing raw paths through the scripts.
 
 ## 4. Run the Baseline
 

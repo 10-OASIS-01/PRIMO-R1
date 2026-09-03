@@ -1,0 +1,45 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Datasets, checkpoints, and generated media (never commit these)
+data/
+models/
+log/
+logs/
+checkpoints/
+eval_outputs/
+src/r1-v/eval_outputs/
+*.mp4
+!src/example_video/*.mp4
+
+# Experiment tracking
+wandb/
+runs/
+*.out
+
+# Training / eval logs
+llm_run*.txt
+nohup.out
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Hugging Face repo cards, staged locally and pushed to the Hub, not here
+hf_cards/

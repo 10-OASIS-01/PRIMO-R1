@@ -19,7 +19,7 @@ import time
 
 parser = argparse.ArgumentParser(description="Evaluation benchmark via API")
 parser.add_argument('--file_name', type=str, required=True, help="Dataset name, json file, or jsonl file")
-parser.add_argument('--api_url', type=str, default=os.environ.get('API_URL', 'http://35.220.164.252:3888/v1/chat/completions'), help="API endpoint URL")
+parser.add_argument('--api_url', type=str, default=os.environ.get('API_URL'), help="OpenAI-compatible /v1/chat/completions endpoint (or set API_URL)")
 parser.add_argument('--api_key', type=str, default=os.environ.get('API_KEY'), help="API key; defaults to API_KEY env var")
 parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'claude-haiku-4-5-20251001'), help="Model name to call")
 parser.add_argument('--workers', type=int, default=4, help="Concurrent API workers")
@@ -34,6 +34,9 @@ API_KEY = args.api_key
 MODEL_NAME = args.model_name
 file_name = args.file_name
 MAX_WORKERS = args.workers
+
+if not API_URL:
+    raise ValueError('Please provide --api_url or set API_URL in the environment.')
 
 if not API_KEY:
     raise ValueError('Please provide --api_key or set API_KEY in the environment.')
@@ -98,7 +101,7 @@ elif (not is_file) and dataset_loader is not None:
 else:
     if not is_file:
          print(f"File not found: {dataset_name_or_path}, assuming it is a dataset name but DatasetLoader not found.")
-         raise ValueError(f"无法读取数据：文件不存在且无法加载数据集 loader。Path: {dataset_name_or_path}")
+         raise ValueError(f"Unable to read data: the file does not exist and DatasetLoader is unavailable. Path: {dataset_name_or_path}")
 
 if args.output_path:
     OUTPUT_PATH = args.output_path
@@ -118,7 +121,7 @@ TYPE_TEMPLATE = {
     "boolean": " Please provide only 'Yes' or 'No' as your answer within the <answer> </answer> tags."
 }
 
-# 预处理数据对
+# Pre-build the data pairs
 pairs = []
 skipped = 0
 for x in data:
@@ -157,7 +160,7 @@ for x in data:
 
     dtype = x.get('data_type', 'video')
 
-    # 原版帧数控制逻辑
+    # Frame-count logic from the original harness
     target_nframes = 16
     if dtype == 'video' and not str(media_path).startswith("http"):
         try:
@@ -188,7 +191,7 @@ if args.sample_size > 0 and len(pairs) > args.sample_size:
 else:
     print(f"Loaded {len(pairs)} examples for API evaluation.")
 
-# 断点续传逻辑
+# Resume-from-checkpoint logic
 final_output = []
 start_idx = 0
 if os.path.exists(OUTPUT_PATH):
@@ -229,7 +232,19 @@ def normalize_number(num_str):
     except Exception as e:
         return None
         
-def mean_relative_accuracy(pred, target, start=0.5, end=0.95, interval=0.05):
+# Name of the formula this harness uses to score `regression`, recorded in the
+# output file so a reader can tell which of the two formulas produced a number.
+# See the metrics section of the top-level README.
+REGRESSION_METRIC = "threshold_relative_accuracy"
+
+
+def threshold_relative_accuracy(pred, target, start=0.5, end=0.95, interval=0.05):
+    """Fraction of thresholds in [start, end] where the relative error clears 1-t.
+
+    This is the stricter, staircase-valued metric used by the baseline harnesses.
+    eval_interleave.py instead uses `linear_relative_accuracy`; the two are not
+    comparable, so never put their numbers in the same column.
+    """
     if not torch.is_tensor(pred):
         pred = torch.tensor(pred, dtype=torch.float32)
     if not torch.is_tensor(target):
@@ -289,13 +304,13 @@ def reward_fn(sample, model_output, question_type):
             out_number = normalize_number(output_ans)
             if gt_number is None or out_number is None:
                 return 0.0
-            return mean_relative_accuracy(out_number, gt_number)
+            return threshold_relative_accuracy(out_number, gt_number)
         else:
             return 0.0
     except Exception as e:
         return 0.0
 
-# 收集历史断点的指标
+# Collect metrics from previously cached samples
 mean_acc = []
 mean_mra = []
 def recompute_cached_rewards(entries):
@@ -329,14 +344,14 @@ def extract_frames_to_base64(media_path, target_nframes):
     frame_indices = [int(i * (actual_frames - 1) / (target_nframes - 1)) for i in range(target_nframes)]
     base64_frames = []
     
-    # 论文要求的最大像素上限
+    # Pixel-budget ceiling required by the paper
     max_pixels = 256 * 28 * 28 
     
     for idx in frame_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if ret:
-            # 【完美对齐】：计算等比例缩放，绝不破坏长宽比
+            # Scale proportionally; never distort the aspect ratio
             h, w = frame.shape[:2]
             if h * w > max_pixels:
                 beta = math.sqrt((h * w) / max_pixels)
@@ -366,13 +381,13 @@ def process_single_sample_api(sample_idx, sample, sample_info):
             for b64 in b64_frames:
                 content_list.append({
                     "type": "image_url",
-                    # 【完美对齐】：改为 high，获取 255 tokens 的视力
+                    # Use "high" detail so the model gets the full 255-token view
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}
                 })
         elif dtype == "image" and not str(media_path).startswith("http"):
             frame = cv2.imread(media_path)
             if frame is not None:
-                # 单图同样使用等比例缩放
+                # Single images are scaled proportionally too
                 h, w = frame.shape[:2]
                 if h * w > max_pixels:
                     beta = math.sqrt((h * w) / max_pixels)
@@ -385,7 +400,7 @@ def process_single_sample_api(sample_idx, sample, sample_info):
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}
                 })
     except Exception as e:
-        # ===== 修改：新增返回耗时 0.0 和 token 0 =====
+        # Also return a 0.0 latency and 0 tokens so callers can unpack uniformly.
         return sample_idx, sample, f"<answer>error: {str(e)}</answer>", 0.0, 0
 
     payload = {
@@ -401,42 +416,42 @@ def process_single_sample_api(sample_idx, sample, sample_info):
 
     max_retries = 5
     for attempt in range(max_retries):
-        start_time = time.time()  # ===== 新增：请求开始计秒表 =====
+        start_time = time.time()
         try:
-            # 1. 调大 timeout 到 300，以适应 32 帧高清图的极长处理时间
+            # 1. A 300s timeout, since 32 high-resolution frames take a long time to process
             response = requests.post(API_URL, headers=headers, json=payload, timeout=600)
             response.raise_for_status()
             
-            # ===== 新增：请求成功，计算耗时 =====
+            # Request succeeded: record the elapsed time
             end_time = time.time()
             generation_time = end_time - start_time
             
             resp_json = response.json()
             output_text = resp_json["choices"][0]["message"]["content"]
             
-            # ===== 新增：尝试从 API 响应中提取 Token 数量 =====
+            # Try to read the token count out of the API response
             token_count = resp_json.get("usage", {}).get("completion_tokens", 0)
             
-            # 2. 成功获取结果后，强制休眠 2 秒，给中转站喘息空间，防止并发超限
+            # 2. Sleep 2s after a success to stay under the relay's concurrency limit
             time.sleep(2)
             
-            # 返回包含了时间和 token
+            # Return the text along with latency and token count
             return sample_idx, sample, output_text, generation_time, token_count
 
         except Exception as e:
             if attempt < max_retries - 1:
-                # 3. 如果请求失败（如 Read timed out），等待一段时间后重试
+                # 3. On failure (e.g. read timeout), back off and retry
                 wait_time = (attempt + 1) * 5 
-                print(f"⚠️ 样本请求失败，{wait_time}秒后进行第 {attempt+2} 次尝试... 错误: {e}")
+                print(f"⚠️ Sample request failed; retrying (attempt {attempt+2}) in {wait_time}s... error: {e}")
                 time.sleep(wait_time)
                 continue
             else:
-                # 4. 彻底失败时，必须将错误信息包装在 <answer> 标签中，防止后续代码解析提取为空
+                # 4. On final failure, wrap the error in <answer> tags so downstream parsing still finds a value
                 output_text = f"<answer>error API after {max_retries} retries: {str(e)}</answer>"
                 return sample_idx, sample, output_text, 0.0, 0
 
 write_lock = Lock()
-print(f"🚀 准备开启多线程评测，并发数量: {MAX_WORKERS}...")
+print(f"🚀 Starting multi-threaded evaluation with {MAX_WORKERS} workers...")
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     futures = {
@@ -445,7 +460,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
     }
 
     for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="API Evaluation Progress"):
-        # ===== 修改：解包接收增加的时间和 token =====
+        # Unpack the added latency and token count
         idx, sample, model_output, gen_time, token_count = future.result()
 
         think_chain = extract_think(model_output)
@@ -456,7 +471,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         sample["output"] = model_output
         sample["prediction"] = final_ans
         
-        # ===== 新增：写入样本字典 =====
+        # Write the per-sample fields
         sample["generation_time"] = round(gen_time, 4)
         sample["output_tokens"] = token_count
         # ===========================
@@ -473,7 +488,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         if think_chain:
             sample["process"] = f"<think>{think_chain}</think>"
             
-        # 实时存入文件以防止意外中断丢失进度
+        # Flush to disk as we go so an interruption does not lose progress
         with write_lock:
             final_output.append(sample)
             try:
@@ -483,13 +498,13 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 pass
 
 
-final_acc={'mean_acc': 0.0, 'mean_mra': 0.0}
+final_acc={'mean_acc': 0.0, 'mean_mra': 0.0, 'regression_metric': REGRESSION_METRIC}
 if mean_acc != []:
     final_acc['mean_acc'] = torch.tensor(mean_acc).mean().item()
 if mean_mra != []:
     final_acc['mean_mra'] = torch.tensor(mean_mra).mean().item()
 
-# ===== 新增：汇总平均时间和 Token =====
+# Aggregate mean latency and output tokens
 valid_samples = len(final_output)
 if valid_samples > 0:
     total_time = sum(item.get("generation_time", 0.0) for item in final_output)
@@ -506,7 +521,7 @@ try:
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         json.dump({"results": final_output, "final_acc": [final_acc]}, f, indent=2, ensure_ascii=False)
     print(f"Final accuracy saved to {OUTPUT_PATH}")
-    # 打印最终面板
+    # Print the final summary panel
     print(f"Final Stats: {json.dumps(final_acc, indent=2)}")
 except Exception as e:
     print(f"Error writing final accuracy to output file: {e}")

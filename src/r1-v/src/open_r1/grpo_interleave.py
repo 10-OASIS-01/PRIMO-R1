@@ -21,7 +21,7 @@ from typing import Optional
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
-from trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
+from trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from datasets import Dataset, DatasetDict
@@ -33,15 +33,14 @@ import wandb
 import os
 from DatasetLoader import dataset_loader
 
-#运行报错补丁
+# Runtime compatibility patch
 import av
 
-# --- 添加这段补丁代码 ---
 try:
-    # 检查是否存在 AVError
+    # Check whether AVError still exists
     av.AVError
 except AttributeError:
-    # 如果不存在（新版 av），则将其指向 FFmpegError，骗过 torchvision
+    # Recent `av` releases dropped AVError; alias it to FFmpegError so torchvision keeps working
     av.AVError = av.FFmpegError
 
 
@@ -155,7 +154,8 @@ def accuracy_reward(completions, solution, **kwargs):
             gt_ans = extract_answer(sol)
             if question_type == "multiple choice":
                 reward = 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
-            elif question_type == "boolean": return 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
+            elif question_type == "boolean":
+                reward = 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
             elif question_type == "numerical":
                 max_range_env = os.environ.get("NUMERIC_MAX_RANGE")
                 try:
@@ -180,38 +180,10 @@ def accuracy_reward(completions, solution, **kwargs):
                 out_number = normalize_number(output_ans)
                 if gt_number is None or out_number is None:
                     reward = 0.0
-                rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
-                rel_diff = min(1.0, max(0.0, rel_diff))
-                reward = 1 - rel_diff
-            # elif question_type == "numerical":
-            #     gt_val = normalize_number(gt_ans)
-            #     out_val = normalize_number(output_ans)
-                
-            #     if gt_val is None or out_val is None:
-            #         reward = 0.0
-            #     else:
-            #         # --- Core Parameter Configuration ---
-            #         # delta: Tolerance margin, set to 0.02 to resolve up to 20 subtasks (0.05 step size)
-            #         delta = 0.02          
-            #         # lambda_succ: Success bonus to provide a strong convergence signal in GRPO groups
-            #         lambda_succ = 3.0     
-            #         # lambda_err: Distance penalty to provide continuous gradient guidance during exploration
-            #         lambda_err = 1.0      
-                    
-            #         # Calculate absolute error
-            #         diff = abs(out_val - gt_val)
-                    
-            #         # --- Accuracy Reward Implementation ---
-            #         # Success Bonus: Grant a significant positive reward if within the acceptable margin
-            #         success_bonus = lambda_succ if diff < delta else 0.0
-                    
-            #         # Distance Penalty: Apply a linear penalty based on the distance from the target
-            #         distance_penalty = lambda_err * diff
-                    
-            #         reward = max(0.0, min(1.0, success_bonus - distance_penalty))
-                    
-            #         # Note: Since GRPO performs group-level z-score normalization, the absolute 
-            #         # scale of these values will be automatically adjusted for the policy gradient.
+                else:
+                    rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
+                    rel_diff = min(1.0, max(0.0, rel_diff))
+                    reward = 1 - rel_diff
             else:
                 reward = 0.0
         except Exception as e:
@@ -256,7 +228,8 @@ reward_funcs_registry = {
 }
 
 
-# 与 SFT 一致：直接使用预处理好的首尾帧路径，不在训练时实时抽帧。
+# Same convention as SFT: use the pre-extracted first/last frame paths instead of
+# sampling frames on the fly during training.
 
 
 DATA_BASE_PATH_ENV = os.environ.get("VIDEO_DATA_ROOT")
@@ -416,14 +389,14 @@ def main(script_args, training_args, model_args):
         
     def make_conversation_image_and_video(example):
         """
-        构建 Initial State + Video + Current State 的多模态输入
-        使用预提取帧路径：直接加载 init_frame_path / current_frame_path
-        
-        输入顺序：
-        1. Initial State（预提取首帧）
-        2. Video (完整视频)
-        3. Current State（预提取尾帧）
-        4. Text (问题文本)
+        Build the Initial State + Video + Current State multimodal input.
+        Uses pre-extracted frame paths: loads init_frame_path / current_frame_path directly.
+
+        Input order:
+        1. Initial State (pre-extracted first frame)
+        2. Video (full clip)
+        3. Current State (pre-extracted last frame)
+        4. Text (question)
         """
         if example["problem_type"] == 'multiple choice':
             question = example['problem'] + "Options:\n"
@@ -432,18 +405,18 @@ def main(script_args, training_args, model_args):
         else:
             question = example['problem']
         
-        # 获取视频/图片路径
+        # Resolve the video/image path
         media_path = example.get('path') or example.get('video') or example.get('video_path')
         media_path = _resolve_media_path(media_path)
         data_type = example.get('data_type', 'video')
         init_frame_path = _resolve_media_path(example.get('init_frame_path'))
         current_frame_path = _resolve_media_path(example.get('current_frame_path'))
         
-        # 构建 content 列表
+        # Build the content list
         content = []
         skip_sample = False
-        
-        # 只对视频类型数据进行 Initial State + Video + Current State 处理
+
+        # Only video samples get the Initial State + Video + Current State treatment
         if data_type == 'video' and media_path:
             if not init_frame_path or not current_frame_path:
                 print(f"[grpo_interleave] Warning: missing frame paths, skipping sample: {media_path}")
@@ -474,7 +447,7 @@ def main(script_args, training_args, model_args):
                 "image": current_frame_path
             })
             
-            # 4. 添加问题文本，加入模态特定的提示
+            # 4. Question text, prefixed with the modality-specific hint
             prompt_prefix = "Given the initial state in the first image, the progress shown in the video, and the current state in the final image, "
             full_question = prompt_prefix + QUESTION_TEMPLATE.format(Question=question, question_type=example["problem_type"]) + TYPE_TEMPLATE.get(example['problem_type'], "")
             content.append({
@@ -482,7 +455,7 @@ def main(script_args, training_args, model_args):
                 "text": full_question
             })
         else:
-            # 对于图片类型或路径无效的情况，保持原有逻辑
+            # Image samples, or samples with an invalid path, keep the original behaviour
             content.append({
                 "type": data_type,
             })
@@ -524,7 +497,12 @@ def main(script_args, training_args, model_args):
     if training_args.eval_strategy != "no" and script_args.dataset_test_split in dataset:
         eval_dataset = dataset[script_args.dataset_test_split]
 
-    trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
+    if training_args.use_vllm:
+        raise NotImplementedError(
+            "vLLM-backed GRPO is not supported in this repository. "
+            "Run with --use_vllm false (the default)."
+        )
+    trainer_cls = Qwen2VLGRPOTrainer
     print("using: ", trainer_cls)
 
     # Initialize the GRPO trainer

@@ -9,8 +9,8 @@ import sys
 import copy
 import cv2
 import torch
-import time      # <--- 新增
-import random    # <--- 新增
+import time
+import random
 from functools import lru_cache
 from PIL import Image
 
@@ -35,18 +35,18 @@ file_name = args.file_name
 BSZ = args.batch_size
 
 
-# ==================== 延迟加载帧提取工具（与 SFT/GRPO 一致）====================
+# ============ Lazy frame extraction helpers (matches SFT/GRPO) ============
 
 @lru_cache(maxsize=256)
 def extract_frames_on_demand(video_path: str):
     """
-    按需提取视频首尾帧，带 LRU 缓存避免重复提取
+    Extract a video's first and last frame on demand, LRU-cached to avoid re-decoding.
     
     Args:
-        video_path: 视频文件路径
+        video_path: path to the video file
         
     Returns:
-        (init_img, current_img): PIL.Image 对象元组，失败返回 (None, None)
+        (init_img, current_img): a pair of PIL.Image objects, or (None, None) on failure
     """
     try:
         cap = cv2.VideoCapture(video_path)
@@ -54,7 +54,7 @@ def extract_frames_on_demand(video_path: str):
             print(f"Warning: Cannot open video: {video_path}")
             return None, None
         
-        # 读取第一帧 (Initial State)
+        # Read the first frame (Initial State)
         ret, first_frame = cap.read()
         if not ret:
             cap.release()
@@ -64,13 +64,13 @@ def extract_frames_on_demand(video_path: str):
         first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
         init_img = Image.fromarray(first_frame_rgb)
         
-        # 读取最后一帧 (Current State)
+        # Read the last frame (Current State)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
         ret, last_frame = cap.read()
         
         if not ret:
-            # 尝试倒数第二帧
+            # Fall back to the second-to-last frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
             ret, last_frame = cap.read()
         
@@ -92,7 +92,7 @@ def extract_frames_on_demand(video_path: str):
 def get_total_frames_cv2(video_path: str) -> int | None:
     """Return total frame count if local video readable, else None."""
     try:
-        # 只对本地路径做；http/https 直接返回 None
+        # Local paths only; http/https returns None
         if str(video_path).startswith("http://") or str(video_path).startswith("https://"):
             return None
         cap = cv2.VideoCapture(video_path)
@@ -105,33 +105,38 @@ def get_total_frames_cv2(video_path: str) -> int | None:
         return None
 
 
+# Upper bound on frames per video. NOTE: the published results were produced with
+# this capped at 22, so --nframes 32 in the launchers effectively sampled 22 frames.
+# Kept as the default for reproducibility; raise INTERLEAVE_MAX_NFRAMES to lift it.
+MAX_NFRAMES = int(os.environ.get("INTERLEAVE_MAX_NFRAMES", 22))
+
+
 def choose_nframes(requested: int, video_path: str) -> int:
     """
-    最小化规则：
-    - 如果视频总帧数 < requested，则用 total_frames
-    - 同时兼容 torchvision fallback 的硬限制：nframes ∈ [2, 22]
+    Clamp the requested frame count:
+    - use total_frames when the video is shorter than `requested`
+    - keep the result within [2, MAX_NFRAMES]
     """
     req = int(requested)
     total = get_total_frames_cv2(video_path)
     if total is not None:
         req = min(req, total)
-    # torchvision fallback 限制
-    req = max(2, min(22, req))
+    req = max(2, min(MAX_NFRAMES, req))
     return req
 
 
 def resolve_frame_placeholders(content_list: list) -> list:
     """
-    解析 content 列表中的帧占位符，实时提取帧
-    
+    Resolve frame placeholders in a content list, extracting frames on the fly.
+
     Args:
-        content_list: 包含占位符的 content 列表
-        
+        content_list: content list containing placeholders
+
     Returns:
-        解析后的 content 列表，占位符被替换为实际的 PIL.Image
+        The resolved content list with placeholders replaced by PIL.Image objects
     """
     resolved = []
-    frame_cache = {}  # 同一视频在本次调用中只提取一次
+    frame_cache = {}  # extract each video at most once per call
     
     for item in content_list:
         if not isinstance(item, dict):
@@ -142,19 +147,19 @@ def resolve_frame_placeholders(content_list: list) -> list:
             image_value = item.get("image")
             
             if isinstance(image_value, dict):
-                # 这是一个占位符
+                # This entry is a placeholder
                 placeholder_type = image_value.get("_placeholder_type")
                 video_path = image_value.get("video_path")
                 
                 if placeholder_type and video_path:
-                    # 从缓存或提取帧
+                    # Take from cache, or extract
                     if video_path not in frame_cache:
                         init_img, current_img = extract_frames_on_demand(video_path)
                         frame_cache[video_path] = (init_img, current_img)
                     else:
                         init_img, current_img = frame_cache[video_path]
                     
-                    # 根据占位符类型选择帧
+                    # Pick the frame matching the placeholder type
                     if placeholder_type == "initial_state":
                         if init_img:
                             resolved.append({"type": "image", "image": init_img})
@@ -170,7 +175,7 @@ def resolve_frame_placeholders(content_list: list) -> list:
                 else:
                     resolved.append(item)
             else:
-                # 正常的 image 项
+                # A regular image entry
                 resolved.append(item)
         else:
             resolved.append(item)
@@ -180,13 +185,13 @@ def resolve_frame_placeholders(content_list: list) -> list:
 
 def resolve_placeholders_in_messages(messages: list) -> list:
     """
-    解析消息列表中所有的帧占位符
-    
+    Resolve every frame placeholder in a message list.
+
     Args:
-        messages: 消息列表
-        
+        messages: the message list
+
     Returns:
-        解析后的消息列表
+        The resolved message list
     """
     for message in messages:
         if "content" in message and isinstance(message["content"], list):
@@ -194,7 +199,7 @@ def resolve_placeholders_in_messages(messages: list) -> list:
     return messages
 
 
-# ==================== 延迟加载帧提取工具结束 ====================
+# ============ End of lazy frame extraction helpers ============
 
 
 llm = LLM(
@@ -202,7 +207,7 @@ llm = LLM(
     tensor_parallel_size=args.tensor_parallel_size or torch.cuda.device_count(),
     max_model_len = 8192 * 2,
     gpu_memory_utilization=0.8,
-    limit_mm_per_prompt={"image": 3, "video": 1},  # 支持 2 张图片(初始+结束) + 1 个视频
+    limit_mm_per_prompt={"image": 3, "video": 1},  # 2 images (initial + current) + 1 video
 )
 
 
@@ -251,17 +256,18 @@ def resolve_media_path(resource_path: str) -> str:
 
 
 """
-单文件/数据集评测：
-- 如果 --file_name 是存在的 .json/.jsonl 路径：直接读取该文件中的样本。
-- 如果 --file_name 不是文件路径：按数据集名称，参考 DatasetLoader.py 加载（返回 json_list + 绝对视频路径）。
-输出文件名根据 file_name（或数据集名）自动生成。
+Single-file / dataset evaluation:
+- If --file_name is an existing .json/.jsonl path, read the samples straight from it.
+- Otherwise treat it as a dataset name and load it through DatasetLoader.py
+  (which returns json_list plus absolute video paths).
+The output filename is derived from file_name (or the dataset name).
 """
 
-# 解析输入：路径或数据集名
+# Resolve the input: a path or a dataset name
 data = []
 dataset_name_or_path = file_name
 
-# 为了支持 DatasetLoader 直接加载，加入项目自带 loader 所在目录到 sys.path。
+# Add the bundled loader directory to sys.path so DatasetLoader can be imported directly.
 from pathlib import Path
 _CANONICAL_LOADER_DIR = Path(__file__).resolve().parents[1] / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(_CANONICAL_LOADER_DIR))
@@ -273,7 +279,7 @@ except Exception:
 is_file = os.path.exists(dataset_name_or_path)
 
 if is_file and (dataset_name_or_path.endswith('.jsonl') or dataset_name_or_path.endswith('.json')):
-    # 直接读取用户提供的 JSON/JSONL
+    # Read the user-supplied JSON/JSONL directly
     if dataset_name_or_path.endswith('.jsonl'):
         with open(dataset_name_or_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -283,16 +289,16 @@ if is_file and (dataset_name_or_path.endswith('.jsonl') or dataset_name_or_path.
             data = json.load(f)
     base_tag = os.path.splitext(os.path.basename(dataset_name_or_path))[0]
 elif (not is_file) and dataset_loader is not None:
-    # 作为数据集名，使用 DatasetLoader 读取
+    # Treat the argument as a dataset name and load it with DatasetLoader
     json_list, video_paths = dataset_loader(dataset_name_or_path)
-    # 将绝对视频路径写回样本，避免后续路径解析不一致
+    # Write absolute video paths back onto the samples to keep later resolution consistent
     for entry, vpath in zip(json_list, video_paths):
         entry = dict(entry)
         entry['path'] = vpath
         data.append(entry)
     base_tag = dataset_name_or_path
 else:
-    raise ValueError(f"无法读取数据：请提供存在的 .json/.jsonl 文件，或可由 DatasetLoader 识别的数据集名。当前: {dataset_name_or_path}")
+    raise ValueError(f"Unable to read data: pass an existing .json/.jsonl file or a dataset name known to DatasetLoader. Got: {dataset_name_or_path}")
 
 if args.sample_size > 0 and len(data) > args.sample_size:
     random.seed(args.seed)
@@ -307,7 +313,7 @@ else:
     OUTPUT_PATH = f"./src/r1-v/eval_outputs/interleave/{base_tag}.json"
 
 
-# 自动创建输出目录
+# Create the output directory
 output_dir = os.path.dirname(OUTPUT_PATH)
 os.makedirs(output_dir, exist_ok=True)
 
@@ -380,14 +386,15 @@ for x in data:
         skipped += 1
         continue
 
-    # resolve media path: 优先支持 http/https 或绝对路径；否则用 VIDEO_DATA_ROOT；再次回退到 JSON 所在目录/其父级
+    # Resolve the media path: prefer http/https or absolute paths, then VIDEO_DATA_ROOT,
+    # then fall back to the JSON's directory and its parents
     if str(raw_path).startswith('http://') or str(raw_path).startswith('https://') or os.path.isabs(raw_path):
         media_path = raw_path
     else:
         try:
             media_path = resolve_media_path(raw_path)
         except Exception:
-            # VIDEO_DATA_ROOT 未设置时回退：尝试以 JSON 文件目录为根
+            # VIDEO_DATA_ROOT unset: fall back to the JSON file's directory as the root
             if is_file:
                 json_dir = os.path.dirname(os.path.abspath(dataset_name_or_path))
                 candidate_paths = [
@@ -418,12 +425,12 @@ for x in data:
         "content": [{"type": "text", "text": SYSTEM_PROMPT}]
     }
 
-    # 构建 Initial State + Video + Current State 输入
+    # Build the Initial State + Video + Current State input
     content = []
     
-    # 只对视频类型数据进行三段式处理
+    # Only video samples get the three-part treatment
     if dtype == 'video' and media_path:
-        # 添加 Initial State (占位符)
+        # Initial State (placeholder)
         content.append({
             "type": "image",
             "image": {
@@ -432,7 +439,7 @@ for x in data:
             }
         })
         
-        # 添加 Video
+        # Video
         nf = choose_nframes(args.nframes, media_path)
         content.append({
             "type": "video",
@@ -440,7 +447,7 @@ for x in data:
             "nframes": nf
         })
         
-        # 添加 Current State (占位符)
+        # Current State (placeholder)
         content.append({
             "type": "image",
             "image": {
@@ -450,14 +457,14 @@ for x in data:
         })
     else:
         nf = choose_nframes(args.nframes, media_path)
-        # 非视频数据，直接使用原始类型
+        # Non-video sample: keep the original data type
         content.append({
             "type": dtype,
             dtype: media_path,
             "nframes": nf
         })
     
-    # 添加文本提问
+    # Append the question text
     content.append({
         "type": "text",
         "text": QUESTION_TEMPLATE.format(
@@ -521,21 +528,23 @@ def normalize_number(num_str):
     except Exception as e:
         return None
         
-def mean_relative_accuracy(pred, target, start=0.5, end=0.95, interval=0.05):
+# Name of the formula this harness uses to score `regression`, recorded in the
+# output file so a reader can tell which of the two formulas produced a number.
+# See the metrics section of the top-level README.
+REGRESSION_METRIC = "linear_relative_accuracy"
 
-    if not torch.is_tensor(pred):
-        pred = torch.tensor(pred, dtype=torch.float32)
-    if not torch.is_tensor(target):
-        target = torch.tensor(target, dtype=torch.float32)
-    
-    epsilon = 1e-8
-    rel_error = torch.abs(pred - target) / (torch.abs(target) + epsilon)
-    
-    thresholds = torch.arange(start, end + interval/2, interval, dtype=torch.float32)
-    
-    conditions = rel_error < (1 - thresholds)  
-    mra = conditions.float().mean()  
-    return mra.item()
+
+def linear_relative_accuracy(pred, target):
+    """Score a regression answer as 1 - |pred-target|/|target|, clipped to [0,1].
+
+    This is the formula behind every published PRIMO-R1 number. The baseline
+    harnesses (eval_local / eval_api / eval_internvl) instead use
+    `threshold_relative_accuracy`, which is stricter; the two are not comparable.
+    """
+    rel_diff = (abs(pred - target) + 1e-9) / (abs(target) + 1e-9)
+    rel_diff = min(1.0, max(0.0, rel_diff))
+    return 1 - rel_diff
+
 
 # Normalized relative score (adapted from eval_bench_aaa but scaled 0-1 instead of 0-100)
 def normalized_relative_score(pred, target, max_range=100.0):
@@ -568,7 +577,7 @@ def reward_fn(sample, model_output, question_type):
         elif question_type == "boolean": 
             return 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
         elif question_type == "free-form":
-            # 使用 ROUGE 分数计算 free-form 类型的 reward
+            # Score free-form answers with ROUGE
             scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
             scores = scorer.score(gt_ans, output_ans)
             average_fmeasure = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
@@ -586,9 +595,7 @@ def reward_fn(sample, model_output, question_type):
             out_number = normalize_number(output_ans)
             if gt_number is None or out_number is None:
                 return 0.0
-            rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
-            rel_diff = min(1.0, max(0.0, rel_diff))
-            return 1 - rel_diff
+            return linear_relative_accuracy(out_number, gt_number)
         else:
             return 0.0
     except Exception as e:
@@ -627,7 +634,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
     batch_pairs = pairs[i:i + BSZ]
     batch_messages = [msgs for (_, msgs) in batch_pairs]
 
-    # 深拷贝并解析占位符
+    # Deep-copy, then resolve placeholders
     batch_messages_resolved = []
     for msgs in batch_messages:
         msgs_copy = copy.deepcopy(msgs)
@@ -646,7 +653,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         for idx, prompt in enumerate(prompts):
             llm_input = {"prompt": prompt, "multi_modal_data": {}}
             
-            # 检查 batch_messages_resolved[idx] 中有几个 image 和 video
+            # Count how many images and videos this sample carries
             user_content = None
             for msg in batch_messages_resolved[idx]:
                 if msg.get("role") == "user":
@@ -667,7 +674,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
             
             llm_inputs.append(llm_input)
 
-        # ===== 修改开始：记录时间和提取 Token 数量 =====
+        # Record generation time and output token count
         start_time = time.time()
         outputs = llm.generate(llm_inputs, sampling_params=sampling_params)
         end_time = time.time()
@@ -690,7 +697,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
                     token_count = 0
             batch_output_text.append(text)
             batch_output_tokens.append(token_count)
-        # ===== 修改结束 =====
+
             
     except Exception as e:
         # report which original sample failed if possible
@@ -719,7 +726,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         sample["output"] = model_output
         sample["prediction"] = final_ans
         
-        # ===== 新增：记录时间和Token =====
+        # Record timing and token counts
         sample["generation_time"] = round(time_per_sample, 4)
         sample["output_tokens"] = token_count
         # ===============================
@@ -728,7 +735,7 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
         sample["reward"] = reward_fn(sample, model_output, q_type)
         sample['correct'] = True if sample["reward"]==1.0 else False
 
-        # Aggregation: numerical & regression 归入 mean_mra; 其他类型(包括 free-form)归入 mean_acc
+        # Aggregation: numerical & regression go to mean_mra; everything else (including free-form) to mean_acc
         if q_type in ("numerical", "regression"):
             mean_mra.append(sample["reward"])
         else:
@@ -745,13 +752,13 @@ for i in tqdm(range(start_idx, len(pairs), BSZ), desc="Processing batches"):
     except Exception as e:
         print(f"Error writing to output file: {e}")
 
-final_acc={'mean_acc': 0.0, 'mean_mra': 0.0}
+final_acc={'mean_acc': 0.0, 'mean_mra': 0.0, 'regression_metric': REGRESSION_METRIC}
 if mean_acc != []:
     final_acc['mean_acc'] = torch.tensor(mean_acc).mean().item()
 if mean_mra != []:
     final_acc['mean_mra'] = torch.tensor(mean_mra).mean().item()
 
-# ===== 新增：汇总平均时间和 Token =====
+# Aggregate mean generation time and output tokens
 valid_samples = len(final_output)
 if valid_samples > 0:
     total_time = sum(item.get("generation_time", 0.0) for item in final_output)

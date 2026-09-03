@@ -63,13 +63,13 @@ import wandb
 
 from typing import List, Dict, Any
 
-# 添加 DatasetLoader 支持
+# DatasetLoader support
 try:
     from DatasetLoader import dataset_loader
 except ImportError:
     dataset_loader = None
 
-# ==================== 数据路径管理工具 ====================
+# ==================== Data path helpers ====================
 
 DATA_BASE_PATH_ENV = os.environ.get("VIDEO_DATA_ROOT")
 _DATA_BASE_PATH = DATA_BASE_PATH_ENV
@@ -168,7 +168,7 @@ def infer_data_base_path(dataset_path: str, dataset: DatasetDict) -> str:
 
     return candidate_roots[0] if candidate_roots else cwd
 
-# ==================== 预处理帧模式（无实时提取，避免并行死锁）====================
+# ============ Pre-extracted frame mode (no on-the-fly extraction, avoids dataloader deadlocks) ============
 
 
 def get_current_device():
@@ -241,18 +241,18 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     else:
         question = example['problem']
 
-    # 获取视频/图片路径
+    # Resolve the video/image path
     media_path = example.get('path') or example.get('video') or example.get('video_path')
     
-    # 尝试解析相对路径（如果配置了 DATA_BASE_PATH）
+    # Try to resolve a relative path (when DATA_BASE_PATH is configured)
     if media_path and _DATA_BASE_PATH is not None:
         try:
             if not (str(media_path).startswith('http://') or str(media_path).startswith('https://') or os.path.isabs(media_path)):
                 media_path = resolve_media_path(media_path)
         except Exception:
-            pass  # 保留原路径
+            pass  # keep the original path
     
-    # 如果是本地文件且不存在，跳过该样本
+    # Skip the sample if it is a local file that does not exist
     if media_path and not (str(media_path).startswith("http://") or str(media_path).startswith("https://")):
         if not os.path.exists(media_path):
             print(f"[sft_interleave] Warning: media not found, skipping example: {media_path}")
@@ -260,12 +260,12 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     
     data_type = example.get('data_type', 'video')
     
-    # 构建 user message content
+    # Build the user message content
     content = []
     
-    # 只对视频类型数据进行 Initial State + Video + Current State 处理
+    # Only video samples get the Initial State + Video + Current State treatment
     if data_type == 'video' and media_path:
-        # ✅ 使用预处理的首尾帧（所有帧已预处理完成）
+        # Use the pre-extracted first/last frames (all frames are prepared offline)
         if 'init_frame_path' not in example or 'current_frame_path' not in example:
             print(f"[sft_interleave] Warning: preprocessed frame paths missing, skipping example: {media_path}")
             return None
@@ -273,7 +273,7 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         init_path = example['init_frame_path']
         current_path = example['current_frame_path']
 
-        # 与 media_path 一致，支持从 JSON 中读取相对帧路径。
+        # Same handling as media_path: relative frame paths from the JSON are supported.
         if _DATA_BASE_PATH is not None:
             try:
                 if not (str(init_path).startswith('http://') or str(init_path).startswith('https://') or os.path.isabs(init_path)):
@@ -283,7 +283,7 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
             except Exception:
                 pass
         
-        # 验证预处理帧文件是否存在
+        # Verify the pre-extracted frame files exist
         if not os.path.exists(init_path):
             print(f"[sft_interleave] Warning: init frame not found, skipping example: {init_path}")
             return None
@@ -291,7 +291,7 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
             print(f"[sft_interleave] Warning: current frame not found, skipping example: {current_path}")
             return None
         
-        # 直接使用预处理的 JPG 图片路径
+        # Use the pre-extracted JPG paths directly
         content.append({
             "type": "image",
             "image": init_path
@@ -307,13 +307,13 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
             "image": current_path
         })
     else:
-        # 非视频数据，直接使用原始类型
+        # Non-video sample: keep the original data type
         content.append({
             "type": data_type,
             data_type: media_path
         })
     
-    # 添加文本提问
+    # Append the question text
     content.append({
         "type": "text",
         "text": QUESTION_TEMPLATE.format(
@@ -325,21 +325,21 @@ def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     # ================= =================
     if 'process' not in example or 'solution' not in example:
         print("\n" + "="*60)
-        print("🚨 发现缺失 'process' 或 'solution' 的异常数据！")
-        print(f"👉 包含的字段 (Keys): {list(example.keys())}")
-        print(f"👉 媒体路径 (Path/Video): {example.get('path', example.get('video', 'N/A'))}")
-        print(f"👉 对应的问题 (Problem): {example.get('problem', 'N/A')}")
+        print("🚨 Found a malformed sample missing 'process' or 'solution'!")
+        print(f"👉 Keys present: {list(example.keys())}")
+        print(f"👉 Media path (path/video): {example.get('path', example.get('video', 'N/A'))}")
+        print(f"👉 Problem: {example.get('problem', 'N/A')}")
         
-        # 为了防内容太长，把完整的 dict 格式化打印出来
+        # Pretty-print the full dict so the log stays readable
         import json
         try:
-            print(f"👉 完整数据详情:\n{json.dumps(example, ensure_ascii=False, indent=2)}")
+            print(f"👉 Full sample:\n{json.dumps(example, ensure_ascii=False, indent=2)}")
         except Exception:
-            print(f"👉 完整数据详情:\n{example}")
+            print(f"👉 Full sample:\n{example}")
             
         print("="*60 + "\n")
         
-        # 手动抛出明确的异常，让程序立刻停止，方便你往上翻日志
+        # Raise explicitly so the run stops immediately and the log above is easy to find
         raise KeyError("Data format error: Missing 'process' or 'solution' key.")
     # ====================================================
     
@@ -373,14 +373,14 @@ def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
 
     for i, example in enumerate(examples):
         try:
-            # ✅ 预处理模式：直接使用 messages，无占位符解析
+            # Pre-extracted mode: use messages as-is, no placeholder resolution
             messages = example["messages"]
             
             texts.append(processor.apply_chat_template(messages, tokenize=False))
             
-            # ✅ 关键修复：按照 egoplan 的方式处理，不使用 return_video_kwargs
+            # Important: follow the egoplan handling and do not pass return_video_kwargs
             imgs, vids = process_vision_info(messages)
-            image_inputs.append(imgs)  # append 而不是 extend
+            image_inputs.append(imgs)  # append, not extend
             video_inputs.append(vids)
             
         except Exception as e:
@@ -389,20 +389,20 @@ def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
             traceback.print_exc()
             raise ValueError(f"Failed to process example {i}: {e}")
 
-    # 使用 processor 处理所有输入
+    # Run every input through the processor
     inputs = processor(
         text=texts,
-        images=image_inputs,  # 直接传递嵌套列表
-        videos=video_inputs,  # 直接传递嵌套列表
+        images=image_inputs,  # pass the nested list directly
+        videos=video_inputs,  # pass the nested list directly
         return_tensors="pt",
         padding=True
     )
     
-    # 创建 labels
+    # Build labels
     labels = inputs["input_ids"].clone()
     labels[labels == processor.tokenizer.pad_token_id] = -100
 
-    # 处理视觉 tokens
+    # Handle vision tokens
     visual_tokens = [151652, 151653, 151656] if isinstance(processor, Qwen2VLProcessor) else [
         processor.tokenizer.convert_tokens_to_ids(processor.image_token)
     ]
@@ -429,13 +429,13 @@ if __name__ == "__main__":
     training_args.remove_unused_columns = False
     training_args.dataset_kwargs = {"skip_prepare_dataset": True}
 
-    # Load dataset(s) using DatasetLoader - 支持多数据集逗号分隔
+    # Load dataset(s) using DatasetLoader - accepts a comma-separated list
     dataset_entries: List[Dict[str, Any]] = []
     ds_arg = str(script_args.dataset_name).strip()
     
     if ds_arg.endswith('.json') or ds_arg.endswith('.jsonl') or os.path.sep in ds_arg:
-        # 兼容：直接传入 JSON 文件路径（单数据集）
-        print(f"[sft_interleave] 兼容模式：从 JSON 文件加载 -> {ds_arg}")
+        # Backward compatible: a raw JSON file path (single dataset)
+        print(f"[sft_interleave] Compatibility mode: loading from JSON file -> {ds_arg}")
         if ds_arg.endswith('.jsonl'):
             with open(ds_arg, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -450,30 +450,30 @@ if __name__ == "__main__":
                 else:
                     dataset_entries.append(data)
     else:
-        # 新模式：通过 DatasetLoader 加载多个数据集
+        # Preferred mode: load one or more datasets through DatasetLoader
         if dataset_loader is None:
             raise ImportError("DatasetLoader not available. Please check sys.path or use JSON file input.")
         
         ds_names = [x.strip() for x in ds_arg.split(',') if x.strip()]
-        print(f"[sft_interleave] 通过 DatasetLoader 加载数据集: {ds_names}")
+        print(f"[sft_interleave] Loading datasets via DatasetLoader: {ds_names}")
         total = 0
         for name in ds_names:
             json_list, video_paths = dataset_loader(name)
-            # 将绝对视频路径写回 entry['path']，避免依赖环境变量
+            # Write the absolute video path back into entry['path'] so no env var is needed later
             for entry, vpath in zip(json_list, video_paths):
                 entry = dict(entry)
                 entry['path'] = vpath
                 dataset_entries.append(entry)
-            print(f"[sft_interleave] 数据集 {name} -> 载入 {len(json_list)} 条")
+            print(f"[sft_interleave] Dataset {name} -> loaded {len(json_list)} samples")
             total += len(json_list)
-        print(f"[sft_interleave] 共载入样本: {total}")
+        print(f"[sft_interleave] Total samples loaded: {total}")
     
-    # 若采用 DatasetLoader 模式，推断或设置数据根目录；若全部为绝对路径，可不设置
+    # In DatasetLoader mode, infer or set the data root; not needed when every path is absolute
     if _DATA_BASE_PATH is None and dataset_entries:
         try:
             tmp_ds = DatasetDict({"train": Dataset.from_list(dataset_entries)})
             set_data_base_path(infer_data_base_path(ds_arg, tmp_ds))
-            print(f"[sft_interleave] 推断数据根目录: {_DATA_BASE_PATH}")
+            print(f"[sft_interleave] Inferred data root: {_DATA_BASE_PATH}")
         except Exception:
             pass
 
@@ -521,18 +521,18 @@ if __name__ == "__main__":
     
     print(f"[sft_interleave] Prepared {len(prepared_dataset)} examples, skipped {skipped_examples} missing media files.")
     
-    # 检查数据集是否为空
+    # Guard against an empty dataset
     if len(prepared_dataset) == 0:
-        raise ValueError(f"❌ 数据集为空！所有 {len(dataset_entries)} 个样本都被跳过。请检查数据路径和预处理状态。")
+        raise ValueError(f"❌ Dataset is empty! All {len(dataset_entries)} samples were skipped. Check the data paths and the frame pre-extraction state.")
     
     # Shuffle training data before feeding into Trainer to avoid ordered ingestion
     if len(prepared_dataset) > 1:
         random.shuffle(prepared_dataset)
         print(f"[sft_interleave] Shuffled training dataset: {len(prepared_dataset)} examples")
 
-    # Initialize wandb if specified
-    if training_args.report_to == "wandb":
-        os.environ.setdefault("WANDB_MODE", "offline")
+    # Initialize wandb if specified. `report_to` is a list in HF TrainingArguments.
+    # WANDB_MODE is intentionally left to the environment so runs stay online by default.
+    if "wandb" in (training_args.report_to or []):
         os.environ.setdefault("WANDB_DIR", "./wandb")
         os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
         run_name = getattr(training_args, "run_name", f"run-{time.strftime('%Y%m%d-%H%M%S')}")
