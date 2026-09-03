@@ -24,7 +24,7 @@ export VIDEO_DATA_ROOT
 export DECORD_EOF_RETRY_MAX
 export PYTHONPATH
 
-# Qwen2.5-VL、Cosmos-Reason1、RoboBrain、ProgressLM
+# Qwen2.5-VL / Cosmos-Reason1 / RoboBrain / ProgressLM
 BASELINE_EVAL_PY=src/eval/eval_local.py
 # InternVL3.5
 # BASELINE_EVAL_PY=src/eval/eval_internvl.py

@@ -40,28 +40,35 @@ if stale_egg_info.exists():
 
 # IMPORTANT: all dependencies should be listed here with their version requirements, if any.
 #   * If a dependency is fast-moving (e.g. transformers), pin to the exact version
+#
+# NOTE on `transformers`: it is deliberately absent from both lists. PRIMO-R1 requires
+# the vendored `transformers-main/` tree at the repository root (`cd transformers-main
+# && pip install .`), because Qwen2.5-VL support shifts between upstream releases and a
+# different version is the usual cause of shape/processor errors. Declaring it here
+# would let pip silently replace that install.
 _deps = [
     "accelerate>=1.2.1",
-    "bitsandbytes>=0.43.0",
     "black>=24.4.2",
     "datasets>=3.2.0",
     "deepspeed==0.15.4",
-    "distilabel[vllm,ray,openai]>=1.5.2",
+    "decord>=0.6.0",
     "einops>=0.8.0",
     "flake8>=6.0.0",
     "hf_transfer>=0.1.4",
     "huggingface-hub[cli]>=0.19.2,<1.0",
     "isort>=5.12.0",
-    "liger_kernel==0.5.2",
-    "lighteval @ git+https://github.com/huggingface/lighteval.git@4f381b352c0e467b5870a97d41cb66b487a2c503#egg=lighteval[math]",
-    "math-verify",  # Used for math verification in grpo
+    "nltk>=3.8.1",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
     "packaging>=23.0",
     "parameterized>=0.9.0",
     "pytest",
+    "requests>=2.31.0",
+    "rouge_score>=0.1.2",
     "safetensors>=0.3.3",
     "sentencepiece>=0.1.99",
     "torch>=2.5.1",
-    # "transformers @ git+https://github.com/huggingface/transformers.git@336dc69d63d56f232a183a3e7f52790429b871ef",
+    "torchvision>=0.20.1",
     "trl==0.16.0",
     "vllm==0.7.2",
     "wandb>=0.19.1",
@@ -85,24 +92,32 @@ extras = {}
 extras["tests"] = deps_list("pytest", "parameterized")
 extras["torch"] = deps_list("torch")
 extras["quality"] = deps_list("black", "isort", "flake8")
-extras["eval"] = deps_list("lighteval", "math-verify")
-extras["dev"] = extras["quality"] + extras["tests"] + extras["eval"]
+extras["dev"] = extras["quality"] + extras["tests"]
 
 # core dependencies shared across the whole project - keep this to a bare minimum :)
+# `transformers` is intentionally omitted; see the note above _deps.
 install_requires = [
     deps["accelerate"],
-    deps["bitsandbytes"],
-    deps["einops"],
     deps["datasets"],
+    deps["decord"],
     deps["deepspeed"],
+    deps["einops"],
     deps["hf_transfer"],
     deps["huggingface-hub"],
-    deps["liger_kernel"],
+    deps["nltk"],  # sentence_bleu, used by the eval harnesses
+    deps["numpy"],
+    deps["opencv-python"],  # frame extraction in training and eval
     deps["packaging"],  # utilities from PyPA to e.g., compare versions
+    deps["pillow"],
+    deps["requests"],  # eval_api.py
+    deps["rouge_score"],  # free-form answer scoring
     deps["safetensors"],
     deps["sentencepiece"],
-    # deps["transformers"],
+    deps["torch"],
+    deps["torchvision"],
     deps["trl"],
+    deps["vllm"],
+    deps["wandb"],
 ]
 
 setup(

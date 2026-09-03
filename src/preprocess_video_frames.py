@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-PRIMO 全量视频首尾帧预处理脚本
+Batch pre-extraction of first/last video frames for the whole PRIMO data tree.
 
-功能：
-1. 覆盖 PRIMO SFT/RL/Bench 全部 23 个数据集。
-2. 提取每个视频的首帧与尾帧。
-3. 帧图按数据源分别保存到 PRIMO-Data/primo-video/<dataset>/frames 下。
-4. 回写 JSON：为每条数据补充 init_frame_path / current_frame_path；提取失败时保留原条目，不丢数据。
+What it does:
+1. Covers all 23 PRIMO SFT/RL/Bench datasets.
+2. Extracts the first and last frame of every video.
+3. Writes the frames per data source under <VIDEO_DATA_ROOT>/primo-video/<dataset>/frames.
+4. Updates the JSON in place, adding init_frame_path / current_frame_path to each record.
+   Entries whose extraction fails are kept unchanged, so no data is dropped.
 """
 
 import json
@@ -21,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 from tqdm import tqdm
 
-# 导入统一的 DatasetLoader
+# Import the shared DatasetLoader
 CURRENT_DIR = Path(__file__).resolve().parent
 LOADER_DIR = CURRENT_DIR / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(LOADER_DIR))
@@ -29,19 +30,20 @@ sys.path.insert(0, str(LOADER_DIR))
 try:
     from DatasetLoader import dataset_loader
 except ImportError:
-    print("无法导入 DatasetLoader，请检查路径")
+    print("Unable to import DatasetLoader; check the path")
     sys.exit(1)
 
 
-# ==================== 配置 ====================
+# ==================== Configuration ====================
 
-DATA_BASE_DIR = os.environ.get("VIDEO_DATA_ROOT", "/mnt/pfs/pg4hw0/yibin_workspace/PRIMO-Data")
+DEFAULT_DATA_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
+DATA_BASE_DIR = os.environ.get("VIDEO_DATA_ROOT", DEFAULT_DATA_BASE_DIR)
 VIDEO_ROOT = os.path.join(DATA_BASE_DIR, "primo-video")
 FRAMES_BASE_DIR = os.path.join(DATA_BASE_DIR, "primo-video")
 NUM_WORKERS = 32
 JPEG_QUALITY = 95
 
-# 全部 23 个 PRIMO 数据集
+# All 23 PRIMO datasets
 DATASET_JSON_MAP: Dict[str, str] = {
     # SFT
     "primo-sft-agibot": "primo-sft/agibot/train_cot.json",
@@ -71,7 +73,7 @@ DATASET_JSON_MAP: Dict[str, str] = {
     "primo-bench-ood-real-humanoid": "primo-bench/real-humanoid/ood.json",
 }
 
-# 数据集名 -> 统一视频源目录名
+# Dataset name -> shared video-source directory name
 DATASET_SOURCE_GROUP: Dict[str, str] = {
     # SFT
     "primo-sft-agibot": "agibot",
@@ -110,12 +112,12 @@ def _select_datasets_from_args() -> List[str]:
         "--only-datasets",
         type=str,
         default="",
-        help="逗号分隔的数据集名列表，仅处理这些数据集",
+        help="Comma-separated dataset names; process only these",
     )
     parser.add_argument(
         "--only-behavior",
         action="store_true",
-        help="仅处理包含 behavior-1k 的数据集",
+        help="Process only the datasets containing behavior-1k",
     )
     args, _ = parser.parse_known_args()
 
@@ -124,7 +126,7 @@ def _select_datasets_from_args() -> List[str]:
 
     if args.only_behavior:
         selected = [d for d in ALL_DATASETS if "behavior-1k" in d]
-        print(f"仅处理 behavior 子集: {selected}")
+        print(f"Processing the behavior subset only: {selected}")
         return selected
 
     raw = cli_only or env_only
@@ -136,23 +138,24 @@ def _select_datasets_from_args() -> List[str]:
     invalid = [x for x in requested if x not in ALL_DATASETS]
 
     if invalid:
-        print(f"忽略未知数据集: {invalid}")
+        print(f"Ignoring unknown datasets: {invalid}")
 
     if not valid:
-        print("未选择到有效数据集，请检查 --only-datasets 或 PRIMO_ONLY_DATASETS")
+        print("No valid dataset selected; check --only-datasets or PRIMO_ONLY_DATASETS")
         sys.exit(1)
 
-    print(f"仅处理指定数据集: {valid}")
+    print(f"Processing only the requested datasets: {valid}")
     return valid
 
 
-# ==================== 工具函数 ====================
+# ==================== Helpers ====================
 
 def _resolve_json_list_container(data: Any) -> Tuple[str, Optional[str], List[Any]]:
     """
-    返回 (container_type, key, list_obj)
+    Return (container_type, key, list_obj).
+
     container_type: list | dict | unknown
-    key: 仅当 dict 时有效
+    key: meaningful only when container_type is dict
     """
     if isinstance(data, list):
         return "list", None, data
@@ -175,10 +178,11 @@ def _extract_frames(
     source_group: str,
 ) -> Optional[Tuple[str, str]]:
     """
-    抽取首尾帧。
-        返回相对 DATA_BASE_DIR 的路径（用于写入 JSON）：
-            ./primo-video/<dataset>/frames/<video_rel_without_dataset_and_ext>_init.jpg
-            ./primo-video/<dataset>/frames/<video_rel_without_dataset_and_ext>_current.jpg
+    Extract the first and last frame.
+
+    Returns paths relative to DATA_BASE_DIR, ready to be written into the JSON:
+        ./primo-video/<dataset>/frames/<video_rel_without_dataset_and_ext>_init.jpg
+        ./primo-video/<dataset>/frames/<video_rel_without_dataset_and_ext>_current.jpg
     """
     if not os.path.exists(video_abs_path):
         return None
@@ -190,7 +194,8 @@ def _extract_frames(
         if not parts:
             return None
 
-        # 即使 dataset_name 不同（如 sft/rl/bench 的 agibot），也统一落到同一个视频源目录。
+        # Datasets that share a video source (e.g. agibot across sft/rl/bench) all land
+        # in the same directory, even though their dataset_name differs.
         if parts[0] == source_group:
             rel_inside_dataset = "/".join(parts[1:])
         else:
@@ -234,7 +239,8 @@ def _extract_frames(
 
 def _process_one(task: Tuple[int, Dict[str, Any], str, str]) -> Tuple[int, Dict[str, Any]]:
     """
-    并行处理单条数据，始终返回 (index, updated_entry)，失败时返回原 entry。
+    Process a single record in a worker. Always returns (index, updated_entry),
+    falling back to the original entry on failure.
     """
     idx, entry, video_abs, source_group = task
 
@@ -260,29 +266,29 @@ def _json_path_for_dataset(dataset_name: str) -> str:
 
 def _process_dataset(dataset_name: str) -> Tuple[int, int]:
     """
-    返回 (total_count, success_count)
+    Return (total_count, success_count).
     """
     json_path = _json_path_for_dataset(dataset_name)
     if not os.path.exists(json_path):
-        print(f"JSON 不存在，跳过: {json_path}")
+        print(f"JSON does not exist, skipping: {json_path}")
         return 0, 0
 
     try:
-        # 使用统一 loader 获取条目与绝对视频路径
+        # Use the shared loader to get records plus absolute video paths
         entries, video_paths = dataset_loader(dataset_name, base_dir=DATA_BASE_DIR)
     except Exception as e:
-        print(f"加载失败: {dataset_name} -> {e}")
+        print(f"Failed to load: {dataset_name} -> {e}")
         return 0, 0
 
     if not entries or len(entries) != len(video_paths):
-        print(f"条目为空或数量不匹配: {dataset_name} ({len(entries)} vs {len(video_paths)})")
+        print(f"No entries, or count mismatch: {dataset_name} ({len(entries)} vs {len(video_paths)})")
         return len(entries), 0
 
-    print(f"\n处理 {dataset_name}: {len(entries)} 条")
+    print(f"\nProcessing {dataset_name}: {len(entries)} records")
 
     source_group = DATASET_SOURCE_GROUP.get(dataset_name)
     if not source_group:
-        print(f"未配置 source_group，跳过: {dataset_name}")
+        print(f"No source_group configured, skipping: {dataset_name}")
         return len(entries), 0
 
     tasks = [(i, entries[i], video_paths[i], source_group) for i in range(len(entries))]
@@ -300,7 +306,7 @@ def _process_dataset(dataset_name: str) -> Tuple[int, int]:
     success_count = 0
     for old, new in zip(entries, updated_entries):
         if "init_frame_path" in new and "current_frame_path" in new:
-            # 只统计本次可用结果，不区分是否旧值已存在
+            # Count only results produced now, regardless of any pre-existing value
             if (
                 new.get("init_frame_path") != old.get("init_frame_path")
                 or new.get("current_frame_path") != old.get("current_frame_path")
@@ -309,7 +315,7 @@ def _process_dataset(dataset_name: str) -> Tuple[int, int]:
             ):
                 success_count += 1
 
-    # 回写 JSON（保留原封装结构）
+    # Write the JSON back, preserving its original container shape
     try:
         backup_path = json_path + ".backup"
         if not os.path.exists(backup_path):
@@ -327,15 +333,15 @@ def _process_dataset(dataset_name: str) -> Tuple[int, int]:
             original[key] = updated_entries
             to_write = original
         else:
-            # 兜底
+            # Fallback
             to_write = updated_entries
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(to_write, f, ensure_ascii=False, indent=2)
 
-        print(f"写回完成: {json_path}")
+        print(f"Write-back complete: {json_path}")
     except Exception as e:
-        print(f"写回失败: {json_path} -> {e}")
+        print(f"Write-back failed: {json_path} -> {e}")
         traceback.print_exc()
 
     return len(entries), success_count
@@ -345,7 +351,7 @@ def main() -> None:
     datasets = _select_datasets_from_args()
 
     print("\n" + "=" * 80)
-    print("PRIMO 首尾帧批处理")
+    print("PRIMO first/last frame batch extraction")
     print("=" * 80)
     print(f"DATA_BASE_DIR : {DATA_BASE_DIR}")
     print(f"VIDEO_ROOT    : {VIDEO_ROOT}")
@@ -366,11 +372,11 @@ def main() -> None:
         total_success += n_ok
 
     print("\n" + "=" * 80)
-    print("处理统计")
+    print("Summary")
     print("=" * 80)
-    print(f"总条目数: {total_entries}")
-    print(f"新增/更新首尾帧字段条目数: {total_success}")
-    print(f"帧图根目录: {FRAMES_BASE_DIR}")
+    print(f"Total records: {total_entries}")
+    print(f"Records with added/updated frame fields: {total_success}")
+    print(f"Frame output root: {FRAMES_BASE_DIR}")
     print("=" * 80)
 
 

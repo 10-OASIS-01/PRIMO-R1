@@ -57,18 +57,18 @@ from qwen_vl_utils import process_vision_info
 import copy
 
 
-# ==================== 延迟加载帧提取工具 ====================
+# ==================== Lazy frame-extraction helpers ====================
 
 @lru_cache(maxsize=256)
 def extract_frames_on_demand(video_path: str):
     """
-    按需提取视频首尾帧，带 LRU 缓存避免重复提取
-    
+    Extract a video's first and last frame on demand, LRU-cached to avoid re-decoding.
+
     Args:
-        video_path: 视频文件路径
-        
+        video_path: path to the video file
+
     Returns:
-        (init_img, current_img): PIL.Image 对象元组，失败返回 (None, None)
+        (init_img, current_img): a pair of PIL.Image objects, or (None, None) on failure.
     """
     try:
         cap = cv2.VideoCapture(video_path)
@@ -76,7 +76,7 @@ def extract_frames_on_demand(video_path: str):
             print(f"Warning: Cannot open video: {video_path}")
             return None, None
         
-        # 读取第一帧 (Initial State)
+        # Read the first frame (Initial State)
         ret, first_frame = cap.read()
         if not ret:
             cap.release()
@@ -85,15 +85,15 @@ def extract_frames_on_demand(video_path: str):
         
         first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
         init_img = Image.fromarray(first_frame_rgb)
-        # print(f"[DEBUG] 成功读取第一帧: {video_path}, shape={first_frame.shape}")
+        # print(f"[DEBUG] Read first frame: {video_path}, shape={first_frame.shape}")
         
-        # 读取最后一帧 (Current State)
+        # Read the last frame (Current State)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
         ret, last_frame = cap.read()
         
         if not ret:
-            # 尝试倒数第二帧
+            # Fall back to the second-to-last frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
             ret, last_frame = cap.read()
         
@@ -101,11 +101,11 @@ def extract_frames_on_demand(video_path: str):
         
         if not ret:
             print(f"Warning: Cannot read last frame, using first frame as fallback: {video_path}")
-            return init_img, init_img  # fallback: 使用第一帧
+            return init_img, init_img  # fallback: reuse the first frame
         
         last_frame_rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
         current_img = Image.fromarray(last_frame_rgb)
-        # print(f"[DEBUG] 成功读取最后一帧: {video_path}, shape={last_frame.shape}")
+        # print(f"[DEBUG] Read last frame: {video_path}, shape={last_frame.shape}")
         
         return init_img, current_img
         
@@ -116,16 +116,16 @@ def extract_frames_on_demand(video_path: str):
 
 def resolve_frame_placeholders(content_list: list) -> list:
     """
-    解析 content 列表中的帧占位符，实时提取帧
-    
+    Resolve frame placeholders in a content list, extracting frames on the fly.
+
     Args:
-        content_list: 包含占位符的 content 列表
-        
+        content_list: a content list that may contain placeholders
+
     Returns:
-        解析后的 content 列表，占位符被替换为实际的 PIL.Image
+        The content list with each placeholder replaced by an actual PIL.Image.
     """
     resolved = []
-    frame_cache = {}  # 同一视频在本次调用中只提取一次
+    frame_cache = {}  # extract each video at most once per call
     
     for item in content_list:
         if not isinstance(item, dict):
@@ -136,29 +136,29 @@ def resolve_frame_placeholders(content_list: list) -> list:
             image_val = item.get("image", "")
             
             if isinstance(image_val, str) and image_val.startswith("__INIT_FRAME__:"):
-                # 解析初始帧占位符
+                # Resolve an initial-frame placeholder
                 video_path = image_val.replace("__INIT_FRAME__:", "")
                 if video_path not in frame_cache:
                     frame_cache[video_path] = extract_frames_on_demand(video_path)
                 init_img, _ = frame_cache[video_path]
                 if init_img is not None:
                     resolved.append({"type": "image", "image": init_img})
-                # 如果提取失败，跳过该项
+                # Skip the item when extraction fails
                     
             elif isinstance(image_val, str) and image_val.startswith("__CURRENT_FRAME__:"):
-                # 解析当前帧占位符
+                # Resolve a current-frame placeholder
                 video_path = image_val.replace("__CURRENT_FRAME__:", "")
                 if video_path not in frame_cache:
                     frame_cache[video_path] = extract_frames_on_demand(video_path)
                 _, current_img = frame_cache[video_path]
                 if current_img is not None:
                     resolved.append({"type": "image", "image": current_img})
-                # 如果提取失败，跳过该项
+                # Skip the item when extraction fails
             else:
-                # 普通图片路径，保持不变
+                # A plain image path: leave it alone
                 resolved.append(item)
         else:
-            # 非图片类型，保持不变
+            # Not an image entry: leave it alone
             resolved.append(item)
     
     return resolved
@@ -166,23 +166,23 @@ def resolve_frame_placeholders(content_list: list) -> list:
 
 def resolve_placeholders_in_messages(messages: list) -> list:
     """
-    解析消息列表中所有的帧占位符
-    
+    Resolve every frame placeholder in a message list.
+
     Args:
-        messages: 消息列表
-        
+        messages: the message list
+
     Returns:
-        解析后的消息列表
+        The message list with placeholders resolved.
     """
-    # 注意：这里不做 deepcopy，因为调用方已经做了 copy.deepcopy(inputs[0]['prompt'])
-    # 如果需要安全起见，可以在这里加上 deepcopy
+    # Note: no deepcopy here, since the caller already does copy.deepcopy(inputs[0]['prompt']).
+    # Add one here if you need extra safety.
     for message in messages:
         if "content" in message and isinstance(message["content"], list):
             message["content"] = resolve_frame_placeholders(message["content"])
     return messages
 
 
-# ==================== 延迟加载帧提取工具结束 ====================
+# ==================== End lazy frame-extraction helpers ====================
 
 
 if is_peft_available():
@@ -550,7 +550,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
     
-        # ====== DEBUG: 打印输入内容 ======
+        # ====== DEBUG: dump the inputs ======
         # print("[DEBUG] inputs:", inputs)
         # print("[DEBUG] prompt_type:", type(inputs[0].get("prompt")))
         prompts = [x["prompt"] for x in inputs]
@@ -561,10 +561,10 @@ class Qwen2VLGRPOTrainer(Trainer):
         input_copy = self.remove_none_from_data(input_copy)
         
         
-        # 使用预提取帧路径：不在训练时解析占位符或实时抽帧。
+        # Use pre-extracted frame paths: do not resolve placeholders or decode frames during training.
 
         
-        # 检查是否需要设置媒体路径（对于没有使用占位符的旧逻辑兼容）
+        # Set media paths when needed (compatibility with the older, placeholder-free path)
         data_type = inputs[0]['data_type']
         if data_type == 'image':
             for content_item in input_copy[0]['content']:
@@ -577,8 +577,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                     content_item['video'] = "/" + inputs[0]['path'][1:] 
                     break
         
-        # ========== 使用解析后的 input_copy 生成 prompts_text ==========
-        # 创建一个临时的 inputs 副本，使用解析后的 prompt
+        # ========== Build prompts_text from the resolved input_copy ==========
+        # Make a temporary copy of inputs that carries the resolved prompt
         inputs_for_template = copy.deepcopy(inputs)
         inputs_for_template[0]['prompt'] = input_copy
         
@@ -661,7 +661,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
 
         
-        # 安全打印路径信息（兼容多模态输入）
+        # Print path info defensively (multimodal inputs vary in shape)
         try:
             data_type = inputs[0].get('data_type', 'video')
             path_info = None
@@ -696,8 +696,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_inputs.pop("input_ids")
         prompt_inputs.pop("attention_mask")
         
-        # ========== 处理多模态输入（支持 image + video + image 混合模式）==========
-        # 分别检查图片和视频，以支持混合模态输入
+        # ========== Handle multimodal inputs (supports mixed image + video + image) ==========
+        # Check images and videos separately so mixed-modality inputs work
         if "pixel_values" in prompt_inputs and prompt_inputs["pixel_values"] is not None:
             prompt_inputs["pixel_values"] = prompt_inputs["pixel_values"].repeat(len(prompt_completion_ids), 1)
             prompt_inputs["image_grid_thw"] = prompt_inputs["image_grid_thw"].repeat(len(prompt_completion_ids), 1)
@@ -707,7 +707,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
             if 'second_per_grid_ts' in prompt_inputs:
                 del prompt_inputs["second_per_grid_ts"]
-        # ========== 多模态输入处理结束 ==========
+        # ========== End multimodal input handling ==========
         
         
         
@@ -737,7 +737,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Compute the KL divergence between the model and the reference model
         
-        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)  # 限制 x 的范围
+        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)  # clamp the range of x
         per_token_kl = torch.exp(x_clamped) - x_clamped - 1
         
         if self.temporal and video_inputs:

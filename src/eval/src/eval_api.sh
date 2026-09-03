@@ -10,8 +10,11 @@ if [ -z "$VIDEO_DATA_ROOT" ]; then
     VIDEO_DATA_ROOT=$PRIMO_ROOT/data
 fi
 
+# OpenAI-compatible chat-completions endpoint. No default: set it explicitly, e.g.
+#   export API_URL=https://api.openai.com/v1/chat/completions
 if [ -z "$API_URL" ]; then
-    API_URL=http://35.220.164.252:3888/v1/chat/completions
+    echo "ERROR: please set API_URL to an OpenAI-compatible /v1/chat/completions endpoint"
+    exit 1
 fi
 
 if [ -z "$MODEL_NAME" ]; then
