@@ -40,7 +40,7 @@ fi
 
 cd "${R1V_DIR}"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" torchrun \
+torchrun \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --nnodes="1" \
     --node_rank="0" \
@@ -60,6 +60,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" torchrun \
     --weight_decay 0.01 \
     --bf16 \
     --logging_steps 1 \
+    --report_to "${REPORT_TO}" \
     --gradient_checkpointing true \
     --temporal false \
     --len_control true \

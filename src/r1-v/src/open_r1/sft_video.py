@@ -12,18 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SFT training with Initial State + Video + Current State input modality.
-Matches the GRPO training input format for consistency.
-
 Example usage:
 accelerate launch \
     --config_file=deepspeed_zero2.yaml \
-    sft_interleave.py \
-    --dataset_name your_dataset.json \
+    train_video_llm.py \
+    --dataset_name mfarre/simplevideoshorts \
     --model_name_or_path Qwen/Qwen2-VL-7B-Instruct \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
-    --output_dir sft-interleave-output \
+    --output_dir video-llm-output \
     --bf16 \
     --torch_dtype bfloat16 \
     --gradient_checkpointing
@@ -32,10 +29,10 @@ accelerate launch \
 import os
 import json
 import random
+import requests
 import torch
 import numpy as np
-import time
-from PIL import Image
+from typing import List, Dict, Any
 from datasets import load_dataset
 from transformers import (
     AutoModelForVision2Seq,
@@ -60,18 +57,14 @@ from qwen_vl_utils import process_vision_info
 from datasets import Dataset, DatasetDict
 
 import wandb
-
-from typing import List, Dict, Any
-
-# DatasetLoader support
-try:
-    from DatasetLoader import dataset_loader
-except ImportError:
-    dataset_loader = None
+import time
+import torch.distributed as dist
+from DatasetLoader import dataset_loader
 
 # Shared prompts live in the repo's own `src/`. src/scripts/common.sh puts it on
-# PYTHONPATH; this makes a direct `python sft_interleave.py` work as well. The
-# import below has to follow the sys.path insert, hence the E402 waiver.
+# PYTHONPATH; this makes a direct `python sft_video.py` work as well. This is the
+# video-only baseline, so it uses the pre-interleave QUESTION_TEMPLATE variant.
+# The imports below have to follow the sys.path insert, hence the E402 waivers.
 import sys
 from pathlib import Path
 
@@ -79,9 +72,8 @@ _PRIMO_SRC = Path(__file__).resolve().parents[3]
 if str(_PRIMO_SRC) not in sys.path:
     sys.path.insert(0, str(_PRIMO_SRC))
 
-from primo_prompts import SYSTEM_PROMPT, QUESTION_TEMPLATE, TYPE_TEMPLATE  # noqa: E402
-
-# ==================== Data path helpers ====================
+from primo_prompts import QUESTION_TEMPLATE_SFT_VIDEO as QUESTION_TEMPLATE  # noqa: E402
+from primo_prompts import TYPE_TEMPLATE  # noqa: E402
 
 DATA_BASE_PATH_ENV = os.environ.get("VIDEO_DATA_ROOT")
 _DATA_BASE_PATH = DATA_BASE_PATH_ENV
@@ -123,11 +115,12 @@ def set_global_seed(seed: int | None) -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
-        import torch.backends.cudnn as cudnn
+        import torch.backends.cudnn as cudnn  # type: ignore
         cudnn.deterministic = True
         cudnn.benchmark = False
     except Exception:
         pass
+    # Encourage deterministic cublas when possible
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 
@@ -180,189 +173,121 @@ def infer_data_base_path(dataset_path: str, dataset: DatasetDict) -> str:
 
     return candidate_roots[0] if candidate_roots else cwd
 
-# ============ Pre-extracted frame mode (no on-the-fly extraction, avoids dataloader deadlocks) ============
-
+# print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
 def get_current_device():
     """Get the current device. For GPU we return the local process index to enable multiple GPU training."""
     return Accelerator().local_process_index if torch.cuda.is_available() else "cpu"
 
+def download_video(url: str, folder: str = '/tmp/videos/') -> str:
+    """Download video if not already present locally."""
+    filename = url.split("/")[-1]
+    local_path = os.path.join(folder, filename)
+
+    if os.path.exists(local_path):
+        return local_path
+
+    try:
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(local_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        return local_path
+    except requests.RequestException as e:
+        raise Exception(f"Failed to download video: {e}")
 
 def prepare_dataset(example: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Prepare dataset example for training with Initial State + Video + Current State modality.
-    Matches GRPO input format.
-    """
+    """Prepare dataset example for training."""
+
+    
+
+    system_message = "You are a helpful assistant"
+    
+    
+
+
     
     if example["problem_type"] == 'multiple choice':
-        question = example['problem'] + "\nOptions:\n"
+        question = example['problem'] + "Options:\n"
         for op in example["options"]:
             question += op + "\n"
     else:
         question = example['problem']
 
-    # Resolve the video/image path
-    media_path = example.get('path') or example.get('video') or example.get('video_path')
-    
-    # Try to resolve a relative path (when DATA_BASE_PATH is configured)
-    if media_path and _DATA_BASE_PATH is not None:
-        try:
-            if not (str(media_path).startswith('http://') or str(media_path).startswith('https://') or os.path.isabs(media_path)):
-                media_path = resolve_media_path(media_path)
-        except Exception:
-            pass  # keep the original path
-    
-    # Skip the sample if it is a local file that does not exist
-    if media_path and not (str(media_path).startswith("http://") or str(media_path).startswith("https://")):
+
+    media_path = resolve_media_path(example['path'])
+
+    # If the media path is a local file, skip the example when the file is missing.
+    # Allow remote URLs (http/https) to pass through.
+    if not (str(media_path).startswith("http://") or str(media_path).startswith("https://")):
         if not os.path.exists(media_path):
-            print(f"[sft_interleave] Warning: media not found, skipping example: {media_path}")
+            print(f"[prepare_dataset] Warning: media not found, skipping example: {media_path}")
             return None
-    
-    data_type = example.get('data_type', 'video')
-    
-    # Build the user message content
-    content = []
-    
-    # Only video samples get the Initial State + Video + Current State treatment
-    if data_type == 'video' and media_path:
-        # Use the pre-extracted first/last frames (all frames are prepared offline)
-        if 'init_frame_path' not in example or 'current_frame_path' not in example:
-            print(f"[sft_interleave] Warning: preprocessed frame paths missing, skipping example: {media_path}")
-            return None
-        
-        init_path = example['init_frame_path']
-        current_path = example['current_frame_path']
 
-        # Same handling as media_path: relative frame paths from the JSON are supported.
-        if _DATA_BASE_PATH is not None:
-            try:
-                if not (str(init_path).startswith('http://') or str(init_path).startswith('https://') or os.path.isabs(init_path)):
-                    init_path = resolve_media_path(init_path)
-                if not (str(current_path).startswith('http://') or str(current_path).startswith('https://') or os.path.isabs(current_path)):
-                    current_path = resolve_media_path(current_path)
-            except Exception:
-                pass
-        
-        # Verify the pre-extracted frame files exist
-        if not os.path.exists(init_path):
-            print(f"[sft_interleave] Warning: init frame not found, skipping example: {init_path}")
-            return None
-        if not os.path.exists(current_path):
-            print(f"[sft_interleave] Warning: current frame not found, skipping example: {current_path}")
-            return None
-        
-        # Use the pre-extracted JPG paths directly
-        content.append({
-            "type": "image",
-            "image": init_path
-        })
-        
-        content.append({
-            "type": "video",
-            "video": media_path
-        })
-        
-        content.append({
-            "type": "image",
-            "image": current_path
-        })
-    else:
-        # Non-video sample: keep the original data type
-        content.append({
-            "type": data_type,
-            data_type: media_path
-        })
-    
-    # Append the question text
-    content.append({
-        "type": "text",
-        "text": QUESTION_TEMPLATE.format(
-            Question=question, 
-            question_type=example["problem_type"]
-        ) + TYPE_TEMPLATE.get(example['problem_type'], "")
-    })
-
-    # ================= =================
-    if 'process' not in example or 'solution' not in example:
-        print("\n" + "="*60)
-        print("🚨 Found a malformed sample missing 'process' or 'solution'!")
-        print(f"👉 Keys present: {list(example.keys())}")
-        print(f"👉 Media path (path/video): {example.get('path', example.get('video', 'N/A'))}")
-        print(f"👉 Problem: {example.get('problem', 'N/A')}")
-        
-        # Pretty-print the full dict so the log stays readable
-        import json
-        try:
-            print(f"👉 Full sample:\n{json.dumps(example, ensure_ascii=False, indent=2)}")
-        except Exception:
-            print(f"👉 Full sample:\n{example}")
-            
-        print("="*60 + "\n")
-        
-        # Raise explicitly so the run stops immediately and the log above is easy to find
-        raise KeyError("Data format error: Missing 'process' or 'solution' key.")
-    # ====================================================
-    
     messages = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+            "content": [{"type": "text", "text": system_message}]
         },
         {
             "role": "user",
-            "content": content
+            "content": [
+                {
+                    "type": example['data_type'],
+                    example['data_type']: media_path
+                    # "max_pixels": 360*420,
+                    # "fps": 1.0
+                },
+                {
+                    "type": "text",
+                    "text": QUESTION_TEMPLATE.format(Question=question, question_type=example['problem_type']) + TYPE_TEMPLATE[example['problem_type']]
+                }
+                # {"type": "text", "text": QUESTION_TEMPLATE.format(Question=question, question_type=TYPE_TEMPLATE.get(example['problem_type'], ""))}
+            ]
         },
         {
             "role": "assistant",
+            # "content": [{"type": "text", "text": example['solution']}]
+            # "content": [{"type": "text", "text": example['planning'] + "\n" + example['solution']}]
+            # "content": [{"type": "text", "text": example['observation'] + "\n" + example['solution']}]
+            # "content": [{"type": "text", "text": example['reasoning'] + "\n" + example['solution']}]
             "content": [{"type": "text", "text": example['process'] + "\n" + example['solution']}]
+
         }
     ]
+    
 
     return {"messages": messages}
 
-
 def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """
-    Collate batch of examples for training.
-    Uses the same approach as sft_egoplan.py to avoid decord deadlock.
-    """
-    
+    """Collate batch of examples for training."""
     texts = []
-    image_inputs = []  # list of lists, not flattened
-    video_inputs = []  # list of lists, not flattened
+    # video_inputs = []
+    # image_inputs = []
 
     for i, example in enumerate(examples):
         try:
-            # Pre-extracted mode: use messages as-is, no placeholder resolution
-            messages = example["messages"]
-            
-            texts.append(processor.apply_chat_template(messages, tokenize=False))
-            
-            # Important: follow the egoplan handling and do not pass return_video_kwargs
-            imgs, vids = process_vision_info(messages)
-            image_inputs.append(imgs)  # append, not extend
-            video_inputs.append(vids)
+
+            texts.append(processor.apply_chat_template(example["messages"], tokenize=False))
+            image_inputs, video_inputs, video_kwargs = process_vision_info(example["messages"], return_video_kwargs=True)
             
         except Exception as e:
-            print(f"❌ FAILED at example {i}: {e}")
-            import traceback
-            traceback.print_exc()
             raise ValueError(f"Failed to process example {i}: {e}")
 
-    # Run every input through the processor
     inputs = processor(
         text=texts,
-        images=image_inputs,  # pass the nested list directly
-        videos=video_inputs,  # pass the nested list directly
+        images=image_inputs,
+        videos=video_inputs,
         return_tensors="pt",
         padding=True
     )
-    
-    # Build labels
+
     labels = inputs["input_ids"].clone()
     labels[labels == processor.tokenizer.pad_token_id] = -100
 
-    # Handle vision tokens
+    # Handle visual tokens based on processor type
     visual_tokens = [151652, 151653, 151656] if isinstance(processor, Qwen2VLProcessor) else [
         processor.tokenizer.convert_tokens_to_ids(processor.image_token)
     ]
@@ -371,69 +296,57 @@ def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         labels[labels == visual_token_id] = -100
 
     inputs["labels"] = labels
-    
     return inputs
-
 
 if __name__ == "__main__":
     # Parse arguments
     parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_config = parser.parse_args_and_config()
-    
     # Set seed early for reproducibility (affects shuffling and any random ops)
     set_global_seed(getattr(training_args, "seed", 42))
-    print(f"[sft_interleave] Using global seed: {getattr(training_args, 'seed', 42)}")
+    print(f"[sft_video] Using global seed: {getattr(training_args, 'seed', 42)}")
     
     # Configure training args
     training_args.gradient_checkpointing_kwargs = dict(use_reentrant=False)
     training_args.remove_unused_columns = False
     training_args.dataset_kwargs = {"skip_prepare_dataset": True}
 
-    # Load dataset(s) using DatasetLoader - accepts a comma-separated list
+    # Load dataset(s) using DatasetLoader.
+    # --dataset_name takes one or more registered dataset names separated by
+    # commas; a single JSON path is also accepted for backward compatibility.
     dataset_entries: List[Dict[str, Any]] = []
     ds_arg = str(script_args.dataset_name).strip()
-    
     if ds_arg.endswith('.json') or ds_arg.endswith('.jsonl') or os.path.sep in ds_arg:
-        # Backward compatible: a raw JSON file path (single dataset)
-        print(f"[sft_interleave] Compatibility mode: loading from JSON file -> {ds_arg}")
-        if ds_arg.endswith('.jsonl'):
-            with open(ds_arg, 'r', encoding='utf-8') as f:
-                for line in f:
-                    dataset_entries.append(json.loads(line.strip()))
-        else:
-            with open(ds_arg, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    dataset_entries.extend(data)
-                elif isinstance(data, dict) and 'data' in data:
-                    dataset_entries.extend(data['data'])
-                else:
-                    dataset_entries.append(data)
+        # Compatibility path: a JSON file given directly (single dataset).
+        print(f"[sft_video] compatibility mode: loading from JSON file -> {ds_arg}")
+        dataset = DatasetDict({"train": Dataset.from_json(ds_arg)})
+        for ex in dataset['train']:
+            dataset_entries.append(dict(ex))
     else:
-        # Preferred mode: load one or more datasets through DatasetLoader
-        if dataset_loader is None:
-            raise ImportError("DatasetLoader not available. Please check sys.path or use JSON file input.")
-        
+        # Registry path: load several datasets through DatasetLoader.
         ds_names = [x.strip() for x in ds_arg.split(',') if x.strip()]
-        print(f"[sft_interleave] Loading datasets via DatasetLoader: {ds_names}")
+        print(f"[sft_video] loading datasets via DatasetLoader: {ds_names}")
         total = 0
         for name in ds_names:
             json_list, video_paths = dataset_loader(name)
-            # Write the absolute video path back into entry['path'] so no env var is needed later
+            # Write the absolute video path back into entry['path'] so the rest
+            # of the pipeline does not depend on environment variables.
             for entry, vpath in zip(json_list, video_paths):
                 entry = dict(entry)
                 entry['path'] = vpath
                 dataset_entries.append(entry)
-            print(f"[sft_interleave] Dataset {name} -> loaded {len(json_list)} samples")
+            print(f"[sft_video] dataset {name} -> loaded {len(json_list)} records")
             total += len(json_list)
-        print(f"[sft_interleave] Total samples loaded: {total}")
-    
-    # In DatasetLoader mode, infer or set the data root; not needed when every path is absolute
-    if _DATA_BASE_PATH is None and dataset_entries:
+        print(f"[sft_video] total samples loaded: {total}")
+
+    # In DatasetLoader mode, infer the data root. Not needed when every path is
+    # already absolute.
+    if _DATA_BASE_PATH is None:
         try:
-            tmp_ds = DatasetDict({"train": Dataset.from_list(dataset_entries)})
-            set_data_base_path(infer_data_base_path(ds_arg, tmp_ds))
-            print(f"[sft_interleave] Inferred data root: {_DATA_BASE_PATH}")
+            # Infer from any relative-path sample; absolute-only sets skip this.
+            if dataset_entries:
+                tmp_ds = DatasetDict({"train": Dataset.from_list(dataset_entries)})
+                _DATA_BASE_PATH = infer_data_base_path(ds_arg, tmp_ds)
         except Exception:
             pass
 
@@ -444,6 +357,14 @@ if __name__ == "__main__":
         else getattr(torch, model_config.torch_dtype)
     )
 
+    # # Quantization configuration for 4-bit training
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_use_double_quant=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16
+    # )
+
     # Model initialization
     # Check if DeepSpeed is being used to avoid device_map conflict
     is_deepspeed = training_args.deepspeed is not None
@@ -453,7 +374,9 @@ if __name__ == "__main__":
         torch_dtype=torch_dtype,
         # DeepSpeed Zero-3 is not compatible with device_map
         device_map=None if is_deepspeed else get_kbit_device_map(),
+        # quantization_config=bnb_config,
     )
+    
     
     if "Qwen2-VL" in model_config.model_name_or_path:
         model = Qwen2VLForConditionalGeneration.from_pretrained(model_config.model_name_or_path, **model_kwargs)
@@ -467,37 +390,33 @@ if __name__ == "__main__":
         trust_remote_code=model_config.trust_remote_code
     )
 
-    # Prepare dataset with Initial State + Video + Current State modality
-    print("[sft_interleave] Preparing dataset with Initial State + Video + Current State modality...")
+    # Prepare dataset and filter out examples with missing local media
     prepared_dataset = []
     skipped_examples = 0
-    
-    for example in dataset_entries:
+    source_iter = dataset_entries if 'dataset' not in locals() else dataset['train']
+    for example in source_iter:
         prepared = prepare_dataset(example)
         if prepared is None:
             skipped_examples += 1
             continue
         prepared_dataset.append(prepared)
-    
-    print(f"[sft_interleave] Prepared {len(prepared_dataset)} examples, skipped {skipped_examples} missing media files.")
-    
-    # Guard against an empty dataset
-    if len(prepared_dataset) == 0:
-        raise ValueError(f"❌ Dataset is empty! All {len(dataset_entries)} samples were skipped. Check the data paths and the frame pre-extraction state.")
-    
+
+    print(f"[sft_video] Prepared {len(prepared_dataset)} examples, skipped {skipped_examples} missing media files.")
+
     # Shuffle training data before feeding into Trainer to avoid ordered ingestion
     if len(prepared_dataset) > 1:
         random.shuffle(prepared_dataset)
-        print(f"[sft_interleave] Shuffled training dataset: {len(prepared_dataset)} examples")
+        print(f"[sft_video] Shuffled training dataset: {len(prepared_dataset)} examples")
 
-    # Initialize wandb if specified. `report_to` is a list in HF TrainingArguments.
-    # WANDB_MODE is intentionally left to the environment so runs stay online by default.
-    if "wandb" in (training_args.report_to or []):
-        os.environ.setdefault("WANDB_DIR", "./wandb")
+    # # Initialize wandb if specified
+    # is_main = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+    if training_args.report_to == "wandb": # and is_main:
+        os.environ.setdefault("WANDB_MODE", "offline")           # default to offline
+        os.environ.setdefault("WANDB_DIR", "./src/r1-v/wandb")
         os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
         run_name = getattr(training_args, "run_name", f"run-{time.strftime('%Y%m%d-%H%M%S')}")
         wandb.init(
-            project=os.environ.get("WANDB_PROJECT", "sft-interleave-training"),
+            project=os.environ.get("WANDB_PROJECT", "video-llm-training-sft"),
             name=run_name,
             config={
                 "learning_rate": training_args.learning_rate,
@@ -509,7 +428,7 @@ if __name__ == "__main__":
             save_code=True
         )
         wandb.watch(model, log="all", log_freq=1)
-    
+
     # Initialize trainer
     trainer = SFTTrainer(
         model=model,
@@ -517,13 +436,14 @@ if __name__ == "__main__":
         train_dataset=prepared_dataset,
         data_collator=collate_fn,
         peft_config=get_peft_config(model_config),
+        # tokenizer=processor.tokenizer
     )
-    
 
     # Train model
     trainer.train()
 
     # Save final model
+
     trainer.save_model(training_args.output_dir)
     processor.save_pretrained(training_args.output_dir)
 
@@ -536,6 +456,4 @@ if __name__ == "__main__":
     del model
     del trainer
     torch.cuda.empty_cache()
-    
-    if training_args.report_to == "wandb":
-        wandb.finish()
+    wandb.finish()

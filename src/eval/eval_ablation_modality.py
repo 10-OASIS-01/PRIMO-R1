@@ -23,9 +23,7 @@ import json
 import re
 from tqdm import tqdm
 import torch
-import cv2
 import numpy as np
-from PIL import Image
 import tempfile
 
 from transformers import AutoProcessor, AutoTokenizer
@@ -38,6 +36,12 @@ from pathlib import Path
 _CANONICAL_LOADER_DIR = Path(__file__).resolve().parents[1] / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(_CANONICAL_LOADER_DIR))
 from DatasetLoader import dataset_loader
+
+# Shared frame-extraction helpers, in `src/`.
+_PRIMO_SRC = Path(__file__).resolve().parents[1]
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+from primo_video_utils import extract_first_and_last_frame  # noqa: E402
 
 
 # The six input modalities
@@ -125,52 +129,6 @@ processor.tokenizer = tokenizer
 
 processor.image_processor.num_frames = 256
 
-
-
-def extract_first_and_last_frame(video_path, temp_dir):
-    """Extract the first frame (initial state) and last frame (current state) of a video."""
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None, None
-        
-        # Read the first frame
-        ret, first_frame = cap.read()
-        if not ret:
-            cap.release()
-            return None, None
-        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        first_img = Image.fromarray(first_frame_rgb)
-        
-        # Seek to the last frame
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
-        ret, last_frame = cap.read()
-        if not ret:
-            # Fall back to the second-to-last frame if the last one cannot be read
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
-            ret, last_frame = cap.read()
-        
-        cap.release()
-        
-        if not ret:
-            return first_img, None
-        
-        last_frame_rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
-        last_img = Image.fromarray(last_frame_rgb)
-        
-        # Write to a temporary file
-        init_path = os.path.join(temp_dir, f"init_{os.path.basename(video_path)}.jpg")
-        current_path = os.path.join(temp_dir, f"current_{os.path.basename(video_path)}.jpg")
-        
-        first_img.save(init_path)
-        last_img.save(current_path)
-        
-        return init_path, current_path
-    
-    except Exception as e:
-        print(f"Error extracting frames from {video_path}: {e}")
-        return None, None
 
 
 def build_content_for_modality(video_path, modality, question_text, temp_dir):

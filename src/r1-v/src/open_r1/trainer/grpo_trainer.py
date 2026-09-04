@@ -17,10 +17,7 @@ import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
 import random
-from functools import lru_cache
 
-import cv2
-from PIL import Image
 import torch
 import torch.utils.data
 import transformers
@@ -55,134 +52,6 @@ from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 from qwen_vl_utils import process_vision_info
 
 import copy
-
-
-# ==================== Lazy frame-extraction helpers ====================
-
-@lru_cache(maxsize=256)
-def extract_frames_on_demand(video_path: str):
-    """
-    Extract a video's first and last frame on demand, LRU-cached to avoid re-decoding.
-
-    Args:
-        video_path: path to the video file
-
-    Returns:
-        (init_img, current_img): a pair of PIL.Image objects, or (None, None) on failure.
-    """
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Warning: Cannot open video: {video_path}")
-            return None, None
-        
-        # Read the first frame (Initial State)
-        ret, first_frame = cap.read()
-        if not ret:
-            cap.release()
-            print(f"Warning: Cannot read first frame from: {video_path}")
-            return None, None
-        
-        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        init_img = Image.fromarray(first_frame_rgb)
-        # print(f"[DEBUG] Read first frame: {video_path}, shape={first_frame.shape}")
-        
-        # Read the last frame (Current State)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
-        ret, last_frame = cap.read()
-        
-        if not ret:
-            # Fall back to the second-to-last frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
-            ret, last_frame = cap.read()
-        
-        cap.release()
-        
-        if not ret:
-            print(f"Warning: Cannot read last frame, using first frame as fallback: {video_path}")
-            return init_img, init_img  # fallback: reuse the first frame
-        
-        last_frame_rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
-        current_img = Image.fromarray(last_frame_rgb)
-        # print(f"[DEBUG] Read last frame: {video_path}, shape={last_frame.shape}")
-        
-        return init_img, current_img
-        
-    except Exception as e:
-        print(f"Error extracting frames from {video_path}: {e}")
-        return None, None
-
-
-def resolve_frame_placeholders(content_list: list) -> list:
-    """
-    Resolve frame placeholders in a content list, extracting frames on the fly.
-
-    Args:
-        content_list: a content list that may contain placeholders
-
-    Returns:
-        The content list with each placeholder replaced by an actual PIL.Image.
-    """
-    resolved = []
-    frame_cache = {}  # extract each video at most once per call
-    
-    for item in content_list:
-        if not isinstance(item, dict):
-            resolved.append(item)
-            continue
-            
-        if item.get("type") == "image":
-            image_val = item.get("image", "")
-            
-            if isinstance(image_val, str) and image_val.startswith("__INIT_FRAME__:"):
-                # Resolve an initial-frame placeholder
-                video_path = image_val.replace("__INIT_FRAME__:", "")
-                if video_path not in frame_cache:
-                    frame_cache[video_path] = extract_frames_on_demand(video_path)
-                init_img, _ = frame_cache[video_path]
-                if init_img is not None:
-                    resolved.append({"type": "image", "image": init_img})
-                # Skip the item when extraction fails
-                    
-            elif isinstance(image_val, str) and image_val.startswith("__CURRENT_FRAME__:"):
-                # Resolve a current-frame placeholder
-                video_path = image_val.replace("__CURRENT_FRAME__:", "")
-                if video_path not in frame_cache:
-                    frame_cache[video_path] = extract_frames_on_demand(video_path)
-                _, current_img = frame_cache[video_path]
-                if current_img is not None:
-                    resolved.append({"type": "image", "image": current_img})
-                # Skip the item when extraction fails
-            else:
-                # A plain image path: leave it alone
-                resolved.append(item)
-        else:
-            # Not an image entry: leave it alone
-            resolved.append(item)
-    
-    return resolved
-
-
-def resolve_placeholders_in_messages(messages: list) -> list:
-    """
-    Resolve every frame placeholder in a message list.
-
-    Args:
-        messages: the message list
-
-    Returns:
-        The message list with placeholders resolved.
-    """
-    # Note: no deepcopy here, since the caller already does copy.deepcopy(inputs[0]['prompt']).
-    # Add one here if you need extra safety.
-    for message in messages:
-        if "content" in message and isinstance(message["content"], list):
-            message["content"] = resolve_frame_placeholders(message["content"])
-    return messages
-
-
-# ==================== End lazy frame-extraction helpers ====================
 
 
 if is_peft_available():
