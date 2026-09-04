@@ -10,6 +10,19 @@ from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
 
+import sys
+from pathlib import Path
+
+# The shared prompt module sits next to this file, in `src/`.
+_PRIMO_SRC = Path(__file__).resolve().parent
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+
+# The CoT teacher is prompted with the pre-interleave Video-R1 prompt, not the
+# PRIMO one: the distilled traces are what the SFT stage then learns to produce.
+from primo_prompts import QUESTION_TEMPLATE_BASELINE as QUESTION_TEMPLATE  # noqa: E402
+from primo_prompts import TYPE_TEMPLATE_BASELINE as TYPE_TEMPLATE  # noqa: E402
+
 
 MODEL_PATH = "Qwen/Qwen2.5-VL-72B-Instruct"
 BSZ = 32
@@ -51,23 +64,6 @@ for dataset_name in ['your_data_name']:
             data = json.load(f)
     else:
         raise ValueError("Input file must be .json or .jsonl")
-
-
-    QUESTION_TEMPLATE = (
-        "{Question}\n"
-        "Please think about this question as if you were a human pondering deeply. "
-        "Engage in an internal dialogue using expressions such as 'let me think', 'wait', 'Hmm', 'oh, I see', 'let's break it down', etc, or other natural language thought expressions "
-        "It's encouraged to include self-reflection or verification in the reasoning process. "
-        "Provide your detailed reasoning between the <think> and </think> tags, and then give your final answer between the <answer> and </answer> tags."
-    )
-
-    TYPE_TEMPLATE = {
-        "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
-        "numerical": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-        "OCR": " Please transcribe text from the image/video clearly and provide your text answer within the <answer> </answer> tags.",
-        "free-form": " Please provide your text answer within the <answer> </answer> tags.",
-        "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags."
-    }
 
 
     messages = []

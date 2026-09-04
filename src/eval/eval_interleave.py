@@ -7,16 +7,28 @@ import re
 import os
 import sys
 import copy
-import cv2
 import torch
 import time
 import random
-from functools import lru_cache
-from PIL import Image
+from pathlib import Path
 
 from transformers import AutoProcessor, AutoTokenizer
 from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
+
+# The shared prompt and frame-extraction modules live in `src/`. The launchers put
+# that on PYTHONPATH; this makes `python src/eval/eval_interleave.py ...` work too.
+_PRIMO_SRC = Path(__file__).resolve().parents[1]
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+
+from primo_prompts import SYSTEM_PROMPT, QUESTION_TEMPLATE, TYPE_TEMPLATE  # noqa: E402
+from primo_video_utils import (  # noqa: E402
+    choose_nframes,
+    current_frame_placeholder,
+    init_frame_placeholder,
+    resolve_placeholders_in_messages,
+)
 
 
 parser = argparse.ArgumentParser(description="Evaluation benchmark with Initial State + Video + Current State")
@@ -34,172 +46,6 @@ MODEL_PATH = args.model_path
 file_name = args.file_name
 BSZ = args.batch_size
 
-
-# ============ Lazy frame extraction helpers (matches SFT/GRPO) ============
-
-@lru_cache(maxsize=256)
-def extract_frames_on_demand(video_path: str):
-    """
-    Extract a video's first and last frame on demand, LRU-cached to avoid re-decoding.
-    
-    Args:
-        video_path: path to the video file
-        
-    Returns:
-        (init_img, current_img): a pair of PIL.Image objects, or (None, None) on failure
-    """
-    try:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Warning: Cannot open video: {video_path}")
-            return None, None
-        
-        # Read the first frame (Initial State)
-        ret, first_frame = cap.read()
-        if not ret:
-            cap.release()
-            print(f"Warning: Cannot read first frame from: {video_path}")
-            return None, None
-        
-        first_frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        init_img = Image.fromarray(first_frame_rgb)
-        
-        # Read the last frame (Current State)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 1))
-        ret, last_frame = cap.read()
-        
-        if not ret:
-            # Fall back to the second-to-last frame
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames - 2))
-            ret, last_frame = cap.read()
-        
-        cap.release()
-        
-        if not ret:
-            print(f"Warning: Cannot read last frame from: {video_path}, using first frame")
-            return init_img, init_img
-        
-        last_frame_rgb = cv2.cvtColor(last_frame, cv2.COLOR_BGR2RGB)
-        current_img = Image.fromarray(last_frame_rgb)
-        
-        return init_img, current_img
-        
-    except Exception as e:
-        print(f"Error extracting frames from {video_path}: {e}")
-        return None, None
-
-def get_total_frames_cv2(video_path: str) -> int | None:
-    """Return total frame count if local video readable, else None."""
-    try:
-        # Local paths only; http/https returns None
-        if str(video_path).startswith("http://") or str(video_path).startswith("https://"):
-            return None
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return total if total > 0 else None
-    except Exception:
-        return None
-
-
-# Upper bound on frames per video. NOTE: the published results were produced with
-# this capped at 22, so --nframes 32 in the launchers effectively sampled 22 frames.
-# Kept as the default for reproducibility; raise INTERLEAVE_MAX_NFRAMES to lift it.
-MAX_NFRAMES = int(os.environ.get("INTERLEAVE_MAX_NFRAMES", 22))
-
-
-def choose_nframes(requested: int, video_path: str) -> int:
-    """
-    Clamp the requested frame count:
-    - use total_frames when the video is shorter than `requested`
-    - keep the result within [2, MAX_NFRAMES]
-    """
-    req = int(requested)
-    total = get_total_frames_cv2(video_path)
-    if total is not None:
-        req = min(req, total)
-    req = max(2, min(MAX_NFRAMES, req))
-    return req
-
-
-def resolve_frame_placeholders(content_list: list) -> list:
-    """
-    Resolve frame placeholders in a content list, extracting frames on the fly.
-
-    Args:
-        content_list: content list containing placeholders
-
-    Returns:
-        The resolved content list with placeholders replaced by PIL.Image objects
-    """
-    resolved = []
-    frame_cache = {}  # extract each video at most once per call
-    
-    for item in content_list:
-        if not isinstance(item, dict):
-            resolved.append(item)
-            continue
-            
-        if item.get("type") == "image":
-            image_value = item.get("image")
-            
-            if isinstance(image_value, dict):
-                # This entry is a placeholder
-                placeholder_type = image_value.get("_placeholder_type")
-                video_path = image_value.get("video_path")
-                
-                if placeholder_type and video_path:
-                    # Take from cache, or extract
-                    if video_path not in frame_cache:
-                        init_img, current_img = extract_frames_on_demand(video_path)
-                        frame_cache[video_path] = (init_img, current_img)
-                    else:
-                        init_img, current_img = frame_cache[video_path]
-                    
-                    # Pick the frame matching the placeholder type
-                    if placeholder_type == "initial_state":
-                        if init_img:
-                            resolved.append({"type": "image", "image": init_img})
-                        else:
-                            print(f"Warning: Failed to extract initial frame, skipping")
-                    elif placeholder_type == "current_state":
-                        if current_img:
-                            resolved.append({"type": "image", "image": current_img})
-                        else:
-                            print(f"Warning: Failed to extract current frame, skipping")
-                    else:
-                        resolved.append(item)
-                else:
-                    resolved.append(item)
-            else:
-                # A regular image entry
-                resolved.append(item)
-        else:
-            resolved.append(item)
-            
-    return resolved
-
-
-def resolve_placeholders_in_messages(messages: list) -> list:
-    """
-    Resolve every frame placeholder in a message list.
-
-    Args:
-        messages: the message list
-
-    Returns:
-        The resolved message list
-    """
-    for message in messages:
-        if "content" in message and isinstance(message["content"], list):
-            message["content"] = resolve_frame_placeholders(message["content"])
-    return messages
-
-
-# ============ End of lazy frame extraction helpers ============
 
 
 llm = LLM(
@@ -268,7 +114,6 @@ data = []
 dataset_name_or_path = file_name
 
 # Add the bundled loader directory to sys.path so DatasetLoader can be imported directly.
-from pathlib import Path
 _CANONICAL_LOADER_DIR = Path(__file__).resolve().parents[1] / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(_CANONICAL_LOADER_DIR))
 try:
@@ -316,58 +161,6 @@ else:
 # Create the output directory
 output_dir = os.path.dirname(OUTPUT_PATH)
 os.makedirs(output_dir, exist_ok=True)
-
-
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The Assistant is an expert AI specializing in embodied procedure and event reasoning based on visual input (video or images). "
-    "The assistant must strictly follow a specific thought process and output format. "
-    "The reasoning process is enclosed within <think> </think> tags, and the final answer is within <answer> </answer> tags. "
-    "The <think> block must contain three ordered subsections: <planning>, <observation>, and <reasoning>. "
-    "The <answer> block must contain only the final output required by the question type and no other commentary."
-)
-
-QUESTION_TEMPLATE = (
-    "QUESTION:\n{Question}\n\n"
-    "QUESTION TYPE:\n{question_type}\n\n"
-    "Analyze the provided visual data and reason about the ongoing task.\n\n"
-    "Please think about this question as if you were a human pondering deeply. "
-    "Provide your detailed reasoning between the <think> and </think> tags, following the subsections <planning>, <observation>, and <reasoning>. "
-    "Then give your final answer between the <answer> and </answer> tags.\n\n"
-    "Below is the required template:\n\n"
-    "<think>\n"
-    "<planning>\n"
-    "Identify the high-level goal of the agent, what is the initial state? What does successful completion look like?\n"
-    "Break down the high-level goal into a logical sequence of canonical steps. This serves as your mental plan for interpreting the task.\n"
-    "Use this plan to interpret actions, map observed behaviors to steps, assess progress, detect anomalies, and predict what happens next.\n"
-    "</planning>\n"
-    "<observation>\n"
-    "View the video as a temporal sequence of actions contributing to the procedure.\n"
-    "Objectively describe what is occurring in the current moment, noting evidence of progress or state changes.\n"
-    "Identify fine-grained actions and explain how they move the task forward.\n"
-    "List relevant objects, tools, and environmental context, emphasizing functional states and transformations.\n"
-    "Note cues—repetition, transitions, or completion indicators—that situate the action in the procedural script.\n"
-    "</observation>\n"
-    "<reasoning>\n"
-    "Think through the question as a human would, Engage in an internal dialogue using expressions such as 'let me think', 'wait', 'hmm', 'oh, I see', 'let's break it down', etc.\n"
-    "Connect observations to the procedural plan to determine which step is being executed, progress, correctness, or anomalies.\n"
-    "Reflect on assumptions, verify interpretations, and, if appropriate, predict the agent's next likely action.\n"
-    "Synthesize understanding of what the agent is doing, how it fits into the broader task, and whether the process seems successful.\n"
-    "You are encouraged to include self-reflection or verification in your reasoning process.\n"
-    "</reasoning>\n"
-    "</think>\n"
-    "<answer>\n"
-    "[Final answer here — strictly follow the `{question_type}` output format and include no extra commentary.]\n"
-    "</answer>"
-)
-
-TYPE_TEMPLATE = {
-    "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
-    "numerical": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "OCR": " Please transcribe text from the image/video clearly and provide your text answer within the <answer> </answer> tags.",
-    "free-form": " Please provide your text answer within the <answer> </answer> tags.",
-    "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "boolean": " Please provide only 'Yes' or 'No' as your answer within the <answer> </answer> tags."
-}
 
 
 # Build (sample, messages) pairs using interleave-style message structure
@@ -431,14 +224,8 @@ for x in data:
     # Only video samples get the three-part treatment
     if dtype == 'video' and media_path:
         # Initial State (placeholder)
-        content.append({
-            "type": "image",
-            "image": {
-                "_placeholder_type": "initial_state",
-                "video_path": media_path
-            }
-        })
-        
+        content.append(init_frame_placeholder(media_path))
+
         # Video
         nf = choose_nframes(args.nframes, media_path)
         content.append({
@@ -446,15 +233,9 @@ for x in data:
             "video": media_path,
             "nframes": nf
         })
-        
+
         # Current State (placeholder)
-        content.append({
-            "type": "image",
-            "image": {
-                "_placeholder_type": "current_state",
-                "video_path": media_path
-            }
-        })
+        content.append(current_frame_placeholder(media_path))
     else:
         nf = choose_nframes(args.nframes, media_path)
         # Non-video sample: keep the original data type

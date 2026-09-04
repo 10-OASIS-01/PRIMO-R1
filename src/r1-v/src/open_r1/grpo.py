@@ -14,11 +14,12 @@
 
 import os
 import re
-import sys
 from datetime import datetime
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
+
+import sys
+from pathlib import Path
 
 import av
 from datasets import load_dataset, load_from_disk
@@ -37,20 +38,20 @@ import os
 from DatasetLoader import dataset_loader
 
 # Shared prompts live in the repo's own `src/`. src/scripts/common.sh puts it on
-# PYTHONPATH; this makes a direct `python grpo_interleave.py` work as well. The
-# import below has to follow the sys.path insert, hence the E402 waiver.
+# PYTHONPATH; this makes a direct `python grpo.py` work as well. The import below
+# has to follow the sys.path insert, hence the E402 waiver.
 _PRIMO_SRC = Path(__file__).resolve().parents[3]
 if str(_PRIMO_SRC) not in sys.path:
     sys.path.insert(0, str(_PRIMO_SRC))
 
 from primo_prompts import SYSTEM_PROMPT, QUESTION_TEMPLATE, TYPE_TEMPLATE  # noqa: E402
 
-# Runtime compatibility patch
+# Compatibility patch: torchvision's video reader probes for av.AVError, which
+# newer versions of PyAV renamed to FFmpegError. Alias it back so the probe
+# succeeds instead of raising AttributeError at import time.
 try:
-    # Check whether AVError still exists
     av.AVError
 except AttributeError:
-    # Recent `av` releases dropped AVError; alias it to FFmpegError so torchvision keeps working
     av.AVError = av.FFmpegError
 
 
@@ -164,8 +165,7 @@ def accuracy_reward(completions, solution, **kwargs):
             gt_ans = extract_answer(sol)
             if question_type == "multiple choice":
                 reward = 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
-            elif question_type == "boolean":
-                reward = 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
+            elif question_type == "boolean": return 1.0 if output_ans.strip().lower() == gt_ans.strip().lower() else 0.0
             elif question_type == "numerical":
                 max_range_env = os.environ.get("NUMERIC_MAX_RANGE")
                 try:
@@ -190,10 +190,9 @@ def accuracy_reward(completions, solution, **kwargs):
                 out_number = normalize_number(output_ans)
                 if gt_number is None or out_number is None:
                     reward = 0.0
-                else:
-                    rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
-                    rel_diff = min(1.0, max(0.0, rel_diff))
-                    reward = 1 - rel_diff
+                rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
+                rel_diff = min(1.0, max(0.0, rel_diff))
+                reward = 1 - rel_diff
             else:
                 reward = 0.0
         except Exception as e:
@@ -238,31 +237,6 @@ reward_funcs_registry = {
 }
 
 
-# Same convention as SFT: use the pre-extracted first/last frame paths instead of
-# sampling frames on the fly during training.
-
-
-DATA_BASE_PATH_ENV = os.environ.get("VIDEO_DATA_ROOT")
-
-
-def _is_remote_path(path: str) -> bool:
-    return isinstance(path, str) and (path.startswith("http://") or path.startswith("https://"))
-
-
-def _resolve_media_path(path: Optional[str]) -> Optional[str]:
-    """Resolve relative media path to absolute path using VIDEO_DATA_ROOT when available."""
-    if not path or not isinstance(path, str):
-        return path
-
-    if _is_remote_path(path) or os.path.isabs(path):
-        return path
-
-    rel = path[2:] if path.startswith("./") else path.lstrip("/")
-    if DATA_BASE_PATH_ENV:
-        return os.path.join(DATA_BASE_PATH_ENV, rel)
-    return path
-
-
 def main(script_args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
@@ -303,12 +277,6 @@ def main(script_args, training_args, model_args):
         }
 
     def make_conversation_image(example):
-        if example["problem_type"] == 'multiple choice':
-            question = example['problem'] + "Options:\n"
-            for op in example["options"]:
-                question += op + "\n"
-        else:
-            question = example['problem']
         
         return {
             "prompt": [
@@ -316,7 +284,7 @@ def main(script_args, training_args, model_args):
                     "role": "user",
                     "content": [
                         {"type": "image"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=question, question_type=example["problem_type"]) + TYPE_TEMPLATE.get(example['problem_type'], "")},
+                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
                     ],
                 },
             ],
@@ -324,131 +292,47 @@ def main(script_args, training_args, model_args):
     
         
     def make_conversation_video(example):
-        if example["problem_type"] == 'multiple choice':
-            question = example['problem'] + "Options:\n"
-            for op in example["options"]:
-                question += op + "\n"
-        else:
-            question = example['problem']
-        
         return {
             "prompt": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "video"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=question, question_type=example["problem_type"]) + TYPE_TEMPLATE.get(example['problem_type'], "")},
+                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
                     ],
                 },
             ],
     }
         
-        
     def make_conversation_image_and_video(example):
-        """
-        Build the Initial State + Video + Current State multimodal input.
-        Uses pre-extracted frame paths: loads init_frame_path / current_frame_path directly.
-
-        Input order:
-        1. Initial State (pre-extracted first frame)
-        2. Video (full clip)
-        3. Current State (pre-extracted last frame)
-        4. Text (question)
-        """
         if example["problem_type"] == 'multiple choice':
             question = example['problem'] + "Options:\n"
             for op in example["options"]:
                 question += op + "\n"
         else:
             question = example['problem']
-        
-        # Resolve the video/image path
-        media_path = example.get('path') or example.get('video') or example.get('video_path')
-        media_path = _resolve_media_path(media_path)
-        data_type = example.get('data_type', 'video')
-        init_frame_path = _resolve_media_path(example.get('init_frame_path'))
-        current_frame_path = _resolve_media_path(example.get('current_frame_path'))
-        
-        # Build the content list
-        content = []
-        skip_sample = False
 
-        # Only video samples get the Initial State + Video + Current State treatment
-        if data_type == 'video' and media_path:
-            if not init_frame_path or not current_frame_path:
-                print(f"[grpo_interleave] Warning: missing frame paths, skipping sample: {media_path}")
-                skip_sample = True
-            elif (
-                (not _is_remote_path(media_path) and not os.path.exists(media_path))
-                or (not _is_remote_path(init_frame_path) and not os.path.exists(init_frame_path))
-                or (not _is_remote_path(current_frame_path) and not os.path.exists(current_frame_path))
-            ):
-                print(f"[grpo_interleave] Warning: media/frame not found, skipping sample: {media_path}")
-                skip_sample = True
-
-            # 1. Initial State
-            content.append({
-                "type": "image", 
-                "image": init_frame_path
-            })
-            
-            # 2. Video
-            content.append({
-                "type": "video",
-                "video": media_path,
-            })
-            
-            # 3. Current State
-            content.append({
-                "type": "image", 
-                "image": current_frame_path
-            })
-            
-            # 4. Question text, prefixed with the modality-specific hint
-            prompt_prefix = "Given the initial state in the first image, the progress shown in the video, and the current state in the final image, "
-            full_question = prompt_prefix + QUESTION_TEMPLATE.format(Question=question, question_type=example["problem_type"]) + TYPE_TEMPLATE.get(example['problem_type'], "")
-            content.append({
-                "type": "text",
-                "text": full_question
-            })
-        else:
-            # Image samples, or samples with an invalid path, keep the original behaviour
-            content.append({
-                "type": data_type,
-            })
-            content.append({
-                "type": "text",
-                "text": QUESTION_TEMPLATE.format(Question=question, question_type=example["problem_type"]) + TYPE_TEMPLATE.get(example['problem_type'], "")
-            })
         
-        msg = {
-            "prompt": [{
-                "role": "user",
-                "content": content,
-            }],
-            "_skip_sample": skip_sample,
-        }
-        
+        msg ={
+            "prompt": 
+               [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": example['data_type'],
+                            # example['data_type']: os.getcwd() + "/Video-R1-data" + example['path'][1:]    
+                        },
+                        {
+                            "type": "text",
+                            "text": QUESTION_TEMPLATE.format(Question=question, question_type=example['problem_type']) + TYPE_TEMPLATE[example['problem_type']]
+                        }
+                        ]
+                }]
+            }
         return msg
-
 
     
     dataset = dataset.map(make_conversation_image_and_video)
-    if "_skip_sample" in dataset[script_args.dataset_train_split].column_names:
-        before_train = len(dataset[script_args.dataset_train_split])
-        dataset[script_args.dataset_train_split] = dataset[script_args.dataset_train_split].filter(
-            lambda x: not x.get("_skip_sample", False)
-        )
-        after_train = len(dataset[script_args.dataset_train_split])
-        print(f"[grpo_interleave] Filtered skipped train samples: {before_train - after_train}")
-
-        if script_args.dataset_test_split in dataset:
-            before_test = len(dataset[script_args.dataset_test_split])
-            dataset[script_args.dataset_test_split] = dataset[script_args.dataset_test_split].filter(
-                lambda x: not x.get("_skip_sample", False)
-            )
-            after_test = len(dataset[script_args.dataset_test_split])
-            print(f"[grpo_interleave] Filtered skipped eval samples: {before_test - after_test}")
 
     eval_dataset = None
     if training_args.eval_strategy != "no" and script_args.dataset_test_split in dataset:

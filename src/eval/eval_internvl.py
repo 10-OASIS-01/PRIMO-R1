@@ -16,6 +16,18 @@ from transformers import AutoProcessor, AutoTokenizer, Qwen2TokenizerFast
 from vllm import LLM, SamplingParams
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
+from pathlib import Path
+
+# The shared prompt module lives in `src/`. The launchers put that on
+# PYTHONPATH; this makes `python src/eval/eval_internvl.py ...` work too.
+_PRIMO_SRC = Path(__file__).resolve().parents[1]
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+
+# InternVL supplies its own instruction framing through its chat template, so
+# this harness passes the bare question rather than the PRIMO prompt.
+from primo_prompts import TYPE_TEMPLATE  # noqa: E402
+from primo_prompts import QUESTION_TEMPLATE_QUESTION_ONLY as QUESTION_TEMPLATE  # noqa: E402
 
 
 parser = argparse.ArgumentParser(description="Evaluation benchmark for InternVL")
@@ -165,7 +177,6 @@ def resolve_media_path(resource_path: str) -> str:
 # Load the data
 data = []
 dataset_name_or_path = file_name
-from pathlib import Path
 _CANONICAL_LOADER_DIR = Path(__file__).resolve().parents[1] / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(_CANONICAL_LOADER_DIR))
 try:
@@ -204,17 +215,6 @@ output_dir = os.path.dirname(OUTPUT_PATH)
 if output_dir:
     os.makedirs(output_dir, exist_ok=True)
 print(f"Results will be saved to: {OUTPUT_PATH}")
-
-# Prompt templates
-QUESTION_TEMPLATE = "{Question}\n"
-TYPE_TEMPLATE = {
-    "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
-    "numerical": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "OCR": " Please transcribe text from the image/video clearly and provide your text answer within the <answer> </answer> tags.",
-    "free-form": " Please provide your text answer within the <answer> </answer> tags.",
-    "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "boolean": " Please provide only 'Yes' or 'No' as your answer within the <answer> </answer> tags."
-}
 
 # Pre-build the data pairs
 pairs = []

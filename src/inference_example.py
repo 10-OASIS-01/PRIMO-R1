@@ -1,9 +1,25 @@
 import os
+import sys
+from pathlib import Path
+
 import torch
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor, AutoTokenizer
 from qwen_vl_utils import process_vision_info
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"  
+
+# The shared prompt module sits next to this file, in `src/`.
+_PRIMO_SRC = Path(__file__).resolve().parent
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+
+# Video-only example, so it uses the pre-interleave baseline prompt. For the
+# released PRIMO R1 checkpoint use `primo_prompts.SYSTEM_PROMPT` /
+# `QUESTION_TEMPLATE` / `TYPE_TEMPLATE` with the interleaved message layout
+# built by `src/eval/eval_interleave.py`.
+from primo_prompts import QUESTION_TEMPLATE_BASELINE as QUESTION_TEMPLATE  # noqa: E402
+from primo_prompts import TYPE_TEMPLATE_BASELINE as TYPE_TEMPLATE  # noqa: E402
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"
 # Set model path
 model_path = "/mnt/pfs/pg4hw0/yibin_workspace/yaxing/Video-R1/src/r1-v/log/Qwen2.5-VL-7B-Video-7B-sft-my"
 # model_path = "/home/algo/models/Cosmos-Reason1-7B/Cosmos-Reason1-7B"
@@ -36,24 +52,6 @@ processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 tokenizer.padding_side = "left"
 processor.tokenizer = tokenizer
-
-# Prompt template
-QUESTION_TEMPLATE = (
-    "{Question}\n"
-    "Please think about this question as if you were a human pondering deeply. "
-    "Engage in an internal dialogue using expressions such as 'let me think', 'wait', 'Hmm', 'oh, I see', 'let's break it down', etc, or other natural language thought expressions "
-    "It's encouraged to include self-reflection or verification in the reasoning process. "
-    "Provide your detailed reasoning between the <think> and </think> tags, and then give your final answer between the <answer> and </answer> tags."
-)
-
-# Question type 
-TYPE_TEMPLATE = {
-    "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
-    "numerical": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "OCR": " Please transcribe text from the image/video clearly and provide your text answer within the <answer> </answer> tags.",
-    "free-form": " Please provide your text answer within the <answer> </answer> tags.",
-    "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags."
-}
 
 # Construct multimodal message
 messages = [

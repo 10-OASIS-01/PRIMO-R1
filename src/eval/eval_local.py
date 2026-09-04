@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import cv2
 from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
@@ -12,6 +11,17 @@ from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
 import argparse
 import sys
+from pathlib import Path
+
+# The shared prompt and frame-extraction modules live in `src/`. The launchers put
+# that on PYTHONPATH; this makes `python src/eval/eval_local.py ...` work too.
+_PRIMO_SRC = Path(__file__).resolve().parents[1]
+if str(_PRIMO_SRC) not in sys.path:
+    sys.path.insert(0, str(_PRIMO_SRC))
+
+from primo_prompts import SYSTEM_PROMPT, TYPE_TEMPLATE  # noqa: E402
+from primo_prompts import QUESTION_TEMPLATE_BASELINE as QUESTION_TEMPLATE  # noqa: E402
+from primo_video_utils import choose_nframes as _choose_nframes  # noqa: E402
 
 
 parser = argparse.ArgumentParser(description="Evaluation benchmark")
@@ -62,31 +72,10 @@ _DATA_BASE_PATH = DATA_BASE_PATH_ENV
 
 
 def choose_nframes(requested: int, video_path: str) -> int:
-    """
-    Matches the original harness: fall back to the real frame count when a video has
-    fewer frames than requested, keeping at least 2.
-    """
-    req = int(requested)
-    total = get_total_frames_cv2(video_path)
-    if total is not None:
-        req = min(req, total)
-    req = max(2, req)
-    return req
+    """Matches the original baseline harness: no upper bound, unlike the
+    interleaved harness which caps at `primo_video_utils.MAX_NFRAMES`."""
+    return _choose_nframes(requested, video_path, max_nframes=None)
 
-
-def get_total_frames_cv2(video_path: str) -> int | None:
-    """Return total frame count if local video readable, else None."""
-    try:
-        if str(video_path).startswith("http://") or str(video_path).startswith("https://"):
-            return None  # HTTP/HTTPS videos are not supported
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        return total if total > 0 else None
-    except Exception:
-        return None
 
 def get_data_base_path() -> str:
     if _DATA_BASE_PATH is None:
@@ -129,7 +118,6 @@ data = []
 dataset_name_or_path = file_name
 
 # Add the bundled loader directory to sys.path so DatasetLoader can be imported directly.
-from pathlib import Path
 _CANONICAL_LOADER_DIR = Path(__file__).resolve().parents[1] / "r1-v" / "src" / "open_r1"
 sys.path.insert(0, str(_CANONICAL_LOADER_DIR))
 try:
@@ -167,24 +155,6 @@ else:
     OUTPUT_PATH = f"./src/r1-v/eval_outputs/local/{base_tag}.json"
 os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 print(f"Results will be saved to: {OUTPUT_PATH}")
-
-QUESTION_TEMPLATE = (
-    "{Question}\n"
-    "Please think about this question as if you were a human pondering deeply. "
-    "Engage in an internal dialogue using expressions such as 'let me think', 'wait', 'Hmm', 'oh, I see', 'let's break it down', etc, or other natural language thought expressions "
-    "It's encouraged to include self-reflection or verification in the reasoning process. "
-    "Provide your detailed reasoning between the <think> and </think> tags, and then give your final answer between the <answer> and </answer> tags."
-)
-
-TYPE_TEMPLATE = {
-    "multiple choice": " Please provide only the single option letter (e.g., A, B, C, D, etc.) within the <answer> </answer> tags.",
-    "numerical": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "OCR": " Please transcribe text from the image/video clearly and provide your text answer within the <answer> </answer> tags.",
-    "free-form": " Please provide your text answer within the <answer> </answer> tags.",
-    "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags.",
-    "boolean": " Please provide only 'Yes' or 'No' as your answer within the <answer> </answer> tags."
-}
-
 
 # Build (sample, messages) pairs using the sft-style message structure, taking video paths from the JSON
 pairs = []
@@ -238,14 +208,6 @@ for x in data:
 
     dtype = x.get('data_type', 'video')
 
-    SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The Assistant is an expert AI specializing in embodied procedure and event reasoning based on visual input (video or images). "
-    "The assistant must strictly follow a specific thought process and output format. "
-    "The reasoning process is enclosed within <think> </think> tags, and the final answer is within <answer> </answer> tags. "
-    "The <think> block must contain three ordered subsections: <planning>, <observation>, and <reasoning>. "
-    "The <answer> block must contain only the final output required by the question type and no other commentary."
-    )
-    
     system_msg = {
         "role": "system",
         "content": [{"type": "text", "text": SYSTEM_PROMPT}]

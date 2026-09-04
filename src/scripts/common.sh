@@ -16,9 +16,10 @@ R1V_DIR="${REPO_ROOT}/src/r1-v"
 export VIDEO_DATA_ROOT="${VIDEO_DATA_ROOT:-${REPO_ROOT}/data}"
 export MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/models}"
 
-# PYTHONPATH must contain both `src` and `src/open_r1` (DatasetLoader is imported
-# as a top-level module by the training entry points).
-export PYTHONPATH="${R1V_DIR}/src:${R1V_DIR}/src/open_r1${PYTHONPATH:+:${PYTHONPATH}}"
+# PYTHONPATH must contain `src` and `src/open_r1` (DatasetLoader is imported as a
+# top-level module by the training entry points) plus the repo's own `src`, which
+# holds the shared `primo_prompts` / `primo_video_utils` modules.
+export PYTHONPATH="${REPO_ROOT}/src:${R1V_DIR}/src:${R1V_DIR}/src/open_r1${PYTHONPATH:+:${PYTHONPATH}}"
 
 # ---------------------------------------------------------------------------
 # Distributed setup
@@ -32,6 +33,10 @@ if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
     fi
 else
     _GPU_COUNT="$(awk -F',' '{print NF}' <<<"${CUDA_VISIBLE_DEVICES}")"
+    # Re-export so the selection reaches torchrun even if it was set as a plain
+    # shell variable. When unset we leave it alone: an empty CUDA_VISIBLE_DEVICES
+    # hides every device, which would give the workers no GPU at all.
+    export CUDA_VISIBLE_DEVICES
 fi
 NPROC_PER_NODE="${NPROC_PER_NODE:-${_GPU_COUNT}}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"

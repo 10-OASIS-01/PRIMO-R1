@@ -28,7 +28,7 @@ echo "[primo] base model      : ${MODEL_PATH}"
 
 cd "${R1V_DIR}"
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" torchrun \
+torchrun \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --nnodes="1" \
     --node_rank="0" \

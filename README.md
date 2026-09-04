@@ -2,15 +2,17 @@
 
 **Reinforcement Learning Elicits Process Reasoning for Robotic Manipulation**
 
-[[📖 Paper](https://arxiv.org/abs/2603.15600)] [[🌐 Project Page](https://10-oasis-01.github.io/primo-r1-website/)]
+[[📖 Paper](https://arxiv.org/abs/2603.15600)] [[🌐 Project Page](https://10-oasis-01.github.io/primo-r1-website/)] [[🤗 Model/Dataset](https://huggingface.co/collections/LeonOverload/primo-r1)]
 
 Yibin Liu, Yaxing Lyu, Daqi Gao, Zhixuan Liang, Weiliang Tang, Shilong Mu, Xiaokang Yang, Yao Mu
-
-Shanghai Jiao Tong University · Northeastern University · Xiamen University Malaysia · The University of Hong Kong · The Chinese University of Hong Kong · Xspark AI
 
 ---
 
 ## About
+
+<p align="center">
+  <img src="assets/mainfigure.png" alt="PRIMO R1 overview: in-domain and OOD environments, the interleaved I_init + V_seq + I_curr input, and the planning/observation/reasoning trace" width="100%">
+</p>
 
 Accurate process supervision is a bottleneck for long-horizon robotic manipulation. Video MLLMs trained under a pure SFT paradigm behave as passive **Observers**: they recognise what is happening rather than judging the current state against the final goal.
 
@@ -66,6 +68,14 @@ Everything is released on Hugging Face, collected under [🤗 PRIMO R1](https://
 | [primo-sft-json](https://huggingface.co/datasets/LeonOverload/primo-sft-json) | stage-1 CoT annotations, 10 subsets / 116,755 records | 856 MB |
 | [primo-rl-json](https://huggingface.co/datasets/LeonOverload/primo-rl-json) | stage-2 RL annotations, 6 subsets / 328,454 records | 1.7 GB |
 | [primo-video-media](https://huggingface.co/datasets/LeonOverload/primo-video-media) | videos + pre-extracted anchor frames, multipart zip | **6.58 TB** |
+
+<p align="center">
+  <img src="assets/dataset_dist.png" alt="Dataset distribution for SFT (left), RL (middle), and PRIMO Bench (right)" width="100%">
+</p>
+
+<p align="center"><em>Dataset distribution for SFT (left), RL (middle), and PRIMO Bench (right).</em></p>
+
+The RL panel shows the 182k mixture the paper trained on; `primo-rl-json` ships 328,454 records because it releases all available `behavior-1k` annotations (206,029) rather than the 60,000 sampled for training. Every other RL subset matches the figure exactly.
 
 **The annotations are small; the videos are not, and they are extremely skewed.** `behavior-1k` alone is 5,981 GB — 91% of the media release. Skip it unless you specifically need the long-horizon progress-estimation results. `robotwin` is 12.5 GB and covers both benchmark robotwin splits plus both robotwin training subsets, so it is the cheapest way to get a working run.
 
@@ -173,7 +183,7 @@ Training reads those two fields from the JSON; evaluation ignores them and re-de
 
 ## Training
 
-Four launchers, all reading paths from the environment. `src/scripts/common.sh` holds the shared setup and is sourced, not run.
+Six launchers, all reading paths from the environment. `src/scripts/common.sh` holds the shared setup and is sourced, not run.
 
 ```bash
 # Stage 1: SFT cold start
@@ -206,6 +216,18 @@ bash src/scripts/run_rl_7b.sh
 | `max_pixels` | — | — | 401408 | 401408 |
 
 **The 3B settings have not been validated.** They are scaled from the 7B recipe (ZeRO-2 instead of ZeRO-3) and are marked as untested in each script. The released checkpoint is 7B.
+
+### Video-only baselines
+
+Two extra launchers keep the pre-interleave recipe reproducible. They are the input-format ablation: same data, same hyper-parameters, but the model sees a bare clip instead of `I_init + V_seq + I_curr`.
+
+```bash
+bash src/scripts/run_sft_baseline_7b.sh    # src/open_r1/sft_video.py
+export SFT_CKPT=/path/to/primo-sft-baseline-7b/checkpoint-XXXX
+bash src/scripts/run_rl_baseline_7b.sh     # src/open_r1/grpo.py
+```
+
+`sft_video.py` and `grpo.py` are the video-only entry points; `sft_interleave.py` and `grpo_interleave.py` are the ones that produced the released checkpoint. Paper Table 4 is the corresponding comparison — dropping the anchor frames raises avg MAE from ~29 to 31–37, and the current frame alone gives 59.50. These baseline configs have not been re-validated since the cleanup.
 
 Anything can be overridden from the environment, e.g. `RUN_NAME`, `OUTPUT_DIR`, `MAX_COMPLETION_LENGTH`, `SFT_DATASET`, `RL_DATASET`, `CUDA_VISIBLE_DEVICES`. GPU count is auto-detected via `nvidia-smi`.
 
@@ -274,9 +296,48 @@ The published PRIMO R1 numbers come from `linear_relative_accuracy`. The thresho
 
 The ablation harness additionally reports MAE, RMSE, Acc@5 and Acc@10 via `compute_metrics`.
 
+### Shared modules
+
+Two modules under `src/` are the single source of truth for everything the entry points used to define locally. Import from them rather than pasting a copy — that is how the prompts drifted in the first place (`SYSTEM_PROMPT` appeared in five files, `TYPE_TEMPLATE` in two silently different variants).
+
+`src/primo_prompts.py` — every prompt:
+
+```python
+from primo_prompts import SYSTEM_PROMPT, QUESTION_TEMPLATE, TYPE_TEMPLATE, build_question
+
+text = build_question(question, problem_type)   # QUESTION_TEMPLATE.format(...) + the type hint
+```
+
+| Name | Used by |
+| --- | --- |
+| `SYSTEM_PROMPT`, `QUESTION_TEMPLATE`, `TYPE_TEMPLATE` | PRIMO R1 — the released checkpoint's format |
+| `QUESTION_TEMPLATE_BASELINE`, `TYPE_TEMPLATE_BASELINE` | video-only baselines, the CoT generator, `inference_example.py` |
+| `QUESTION_TEMPLATE_SFT_VIDEO` | `sft_video.py`, the video-only SFT baseline |
+| `QUESTION_TEMPLATE_PARSER_ONLY` | `eval_api.py` — remote models wrap answers in prose |
+| `QUESTION_TEMPLATE_QUESTION_ONLY` | `eval_internvl.py` — InternVL supplies its own framing |
+
+The variants are not redundancy. `TYPE_TEMPLATE_BASELINE` is `TYPE_TEMPLATE` minus the `boolean` key, and the baseline numbers in the paper were produced without it, so adding the key would change which records get a type hint. Each is preserved verbatim.
+
+`src/primo_video_utils.py` — the frame helpers behind the interleaved format:
+
+```python
+from primo_video_utils import (
+    extract_frames_on_demand,       # (init, current) as PIL, LRU-cached
+    extract_first_and_last_frame,   # the same two frames written out as JPEGs
+    choose_nframes,                 # clamp the requested frame count
+    init_frame_placeholder,         # defer extraction until collation
+    current_frame_placeholder,
+    resolve_placeholders_in_messages,
+)
+```
+
+`MAX_NFRAMES` (env `INTERLEAVE_MAX_NFRAMES`) defaults to 22, which is the effective cap the published numbers were produced with even though the launchers pass `--nframes 32`. The video-only baseline harness never had an upper bound and passes `max_nframes=None` to keep its own numbers reproducible.
+
+Both modules are importable because `src/scripts/common.sh` puts the repo's `src` on `PYTHONPATH`; each entry point also inserts it itself, so running a script directly with `python` works.
+
 ### Prompt coupling
 
-The shared `QUESTION_TEMPLATE` + `TYPE_TEMPLATE` asks the model to ground observations in a procedural plan and emit a strictly formatted final answer. The answer extractors `extract_think` and `extract_answer` are coupled to that format — changing the prompt without updating them will silently collapse scores rather than error out.
+`QUESTION_TEMPLATE` + `TYPE_TEMPLATE` ask the model to ground observations in a procedural plan and emit a strictly formatted final answer. The answer extractors `extract_think` and `extract_answer` are coupled to that format — editing a prompt without updating them will silently collapse scores rather than error out. Treat `primo_prompts.py` and the extractors as one unit.
 
 ## Single example
 
@@ -295,17 +356,6 @@ make quality    # check-only + flake8
 ```
 
 ## Citation
-
-```bibtex
-@inproceedings{liu2026primo,
-  title     = {From Passive Observer to Active Critic: Reinforcement Learning Elicits Process Reasoning for Robotic Manipulation},
-  author    = {Liu, Yibin and Lyu, Yaxing and Gao, Daqi and Liang, Zhixuan and Tang, Weiliang and Mu, Shilong and Yang, Xiaokang and Mu, Yao},
-  booktitle = {European Conference on Computer Vision (ECCV)},
-  year      = {2026}
-}
-```
-
-The preprint, as cited on the Hugging Face cards:
 
 ```bibtex
 @misc{liu2026passiveobserveractivecritic,
