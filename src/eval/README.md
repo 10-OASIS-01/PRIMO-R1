@@ -1,8 +1,24 @@
-# PRIMO-R1 Evaluation
+# PRIMO R1 Evaluation
 
-Evaluation launch scripts are located in `src/eval/src/`. Run the appropriate script from the project root.
+Four launchers live in `src/eval/src/`. Run them from the project root.
+
+```bash
+bash src/eval/src/eval_baseline_local.sh     # local baselines, vLLM  -> eval_outputs/baseline/
+bash src/eval/src/eval_interleave_local.sh   # PRIMO R1 models        -> eval_outputs/interleave/
+bash src/eval/src/eval_ablation.sh           # input-modality sweep   -> eval_outputs/ablation/
+bash src/eval/src/eval_api.sh                # remote API models      -> eval_outputs/api/
+```
+
+Results land in `src/r1-v/eval_outputs/<kind>/<model_name>/<dataset>.json`, with
+per-sample records under `results` and a summary under `final_acc`. Every
+harness resumes from an existing output file, so an interrupted run continues
+where it stopped.
 
 The benchmark itself — split sizes, record format, and which video group each split needs — is documented on [🤗 primo-bench-json](https://huggingface.co/datasets/LeonOverload/primo-bench-json).
+
+Decoding follows the Qwen2.5-VL demo: `top_p=0.001`, `temperature=0.01`. Larger
+`top_p` produces garbled output. Training caps videos at 16 frames; eval samples
+more at higher resolution.
 
 ## 1. Environment Setup
 
@@ -138,3 +154,45 @@ Results are saved to:
 ```text
 src/r1-v/eval_outputs/api/<model_name>/<dataset>.json
 ```
+
+## 8. Metrics, and one divergence worth knowing
+
+Answers are scored per `problem_type` by `reward_fn`: `multiple choice` and
+`boolean` are exact match, `free-form` is mean ROUGE-1/2/L F-measure, and
+`numerical` / `regression` are relative-accuracy scores.
+
+**The harnesses score `regression` with three different formulas.** They are not
+comparable, so never place their numbers in the same column. Each harness records
+which one it used in the `regression_metric` field of its output JSON:
+
+| Harness | `regression_metric` | Formula |
+| --- | --- | --- |
+| `eval_interleave.py` | `linear_relative_accuracy` | `1 - abs(pred-gt)/abs(gt)`, clipped to [0,1] |
+| `eval_local.py`, `eval_api.py`, `eval_internvl.py` | `threshold_relative_accuracy` | fraction of thresholds t ∈ [0.5, 0.95] step 0.05 where relative error < 1-t |
+| `eval_ablation_modality.py` | `absolute_range_accuracy` | `1 - abs(pred-gt)/100`, against a fixed 0–100 progress range |
+
+The published PRIMO R1 numbers come from `linear_relative_accuracy`. The
+threshold variant is stricter and takes only 10 discrete values per sample. The
+math is preserved exactly as it was when the paper's numbers were produced; only
+the names were unified.
+
+The ablation harness additionally reports MAE, RMSE, Acc@5 and Acc@10 via
+`compute_metrics`.
+
+## 9. Input format
+
+"Interleave" is the PRIMO input format — `I_init + V_seq + I_curr` — versus the
+baseline's video-only input. `eval_ablation_modality.py` sweeps the six
+combinations to isolate each component's contribution: `current_only`,
+`init_current`, `video_only`, `video_current`, `init_video`,
+`init_video_current`.
+
+Evaluation ignores the `init_frame_path` / `current_frame_path` fields in the
+JSON and re-derives both anchor frames with OpenCV at run time, so no
+preprocessing step is needed.
+
+Prompts come from `src/primo_prompts.py`, frame helpers from
+`src/primo_video_utils.py`. The answer extractors `extract_think` and
+`extract_answer` are coupled to the prompt format — editing one without the
+other silently collapses scores rather than erroring. See
+[`src/README.md`](../README.md).
