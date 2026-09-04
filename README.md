@@ -1,6 +1,6 @@
 # PRIMO R1: From Passive Observer to Active Critic
 
-**Reinforcement Learning Elicits Process Reasoning for Robotic Manipulation**
+**Reinforcement Learning Elicits Process Reasoning for Robotic Manipulation (ECCV 2026)**
 
 [[📖 Paper](https://arxiv.org/abs/2603.15600)] [[🌐 Project Page](https://10-oasis-01.github.io/primo-r1-website/)] [[🤗 Model/Dataset](https://huggingface.co/collections/LeonOverload/primo-r1)]
 
