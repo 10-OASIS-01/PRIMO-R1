@@ -6,7 +6,6 @@
 
 Yibin Liu, Yaxing Lyu, Daqi Gao, Zhixuan Liang, Weiliang Tang, Shilong Mu, Xiaokang Yang, Yao Mu
 
----
 
 ## About
 
@@ -202,16 +201,6 @@ erroring — see [`src/README.md`](src/README.md).
 
 ```bash
 python ./src/inference_example.py
-```
-
-## Lint
-
-`src/r1-v` carries the upstream open-r1 tooling. There is no test suite.
-
-```bash
-cd src/r1-v
-make style      # black --line-length 119 + isort
-make quality    # check-only + flake8
 ```
 
 ## Citation
